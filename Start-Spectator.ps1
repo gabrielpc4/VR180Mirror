@@ -174,7 +174,7 @@ if (-not $NoOBS) {
     } else {
         Start-Process -FilePath "C:\Program Files\obs-studio\bin\64bit\obs64.exe" `
             -WorkingDirectory "C:\Program Files\obs-studio\bin\64bit" `
-            -ArgumentList "--multi","--only-bundled-plugins","--disable-shutdown-check",
+            -ArgumentList "--multi","--only-bundled-plugins","--disable-shutdown-check","--disable-updater",
                           "--profile","VR180Mirror","--collection","VR180Mirror",
                           "--startstreaming","--minimize-to-tray"
         Write-Host "OBS started (profile VR180Mirror, streaming to WHIP)"
@@ -200,7 +200,7 @@ if (-not $NoOBS) {
         Start-Sleep -Seconds 3
         Start-Process -FilePath "C:\Program Files\obs-studio\bin\64bit\obs64.exe" `
             -WorkingDirectory "C:\Program Files\obs-studio\bin\64bit" `
-            -ArgumentList "--multi","--only-bundled-plugins","--disable-shutdown-check",
+            -ArgumentList "--multi","--only-bundled-plugins","--disable-shutdown-check","--disable-updater",
                           "--profile","VR180Mirror","--collection","VR180Mirror",
                           "--startstreaming","--minimize-to-tray"
     }
