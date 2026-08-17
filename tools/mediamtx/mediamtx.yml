@@ -6,8 +6,8 @@
 # (8889/8189/8554/1935/8080 are left alone).
 
 logLevel: info
-# runs as a hidden process; logs go to a file (tools\mediamtx\mediamtx.log)
-logDestinations: [file]
+# visible console + log file (close the window and the launcher restarts it next run)
+logDestinations: [stdout, file]
 logFile: mediamtx.log
 
 # large socket buffer: the local WHIP publisher bursts RTP packets; avoid drops
