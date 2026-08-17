@@ -42,6 +42,7 @@ public class MainActivity extends Activity {
     private CheckBox headlockBox;
     private CheckBox mutedBox;
     private CheckBox fullpicBox;
+    private CheckBox delayBox;
     private SharedPreferences prefs;
 
     private volatile boolean alive = true;
@@ -123,6 +124,13 @@ public class MainActivity extends Activity {
         fullpicBox.setTextSize(15);
         fullpicBox.setChecked(prefs.getBoolean("fullpic", false));
         root.addView(fullpicBox);
+
+        delayBox = new CheckBox(this);
+        delayBox.setText("Prefer delaying over skipping (constant 72fps, ~1.5s buffer)");
+        delayBox.setTextColor(ink);
+        delayBox.setTextSize(15);
+        delayBox.setChecked(prefs.getBoolean("delay", false));
+        root.addView(delayBox);
 
         TextView spacer = new TextView(this);
         spacer.setHeight(dp(20));
@@ -229,12 +237,14 @@ public class MainActivity extends Activity {
                 .putBoolean("headlock", headlockBox.isChecked())
                 .putBoolean("muted", mutedBox.isChecked())
                 .putBoolean("fullpic", fullpicBox.isChecked())
+                .putBoolean("delay", delayBox.isChecked())
                 .apply();
         String url = "http://localhost:" + HTTP_PORT + "/"
                 + "?auto=1"
                 + "&headlock=" + (headlockBox.isChecked() ? 1 : 0)
                 + "&muted=" + (mutedBox.isChecked() ? 1 : 0)
-                + "&fullpic=" + (fullpicBox.isChecked() ? 1 : 0);
+                + "&fullpic=" + (fullpicBox.isChecked() ? 1 : 0)
+                + "&delay=" + (delayBox.isChecked() ? 1 : 0);
         startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
     }
 }

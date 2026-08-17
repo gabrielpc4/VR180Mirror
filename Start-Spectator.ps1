@@ -18,7 +18,15 @@ param(
     # (hardware AV1 decode). h264: 3840x1920@72 fallback, works everywhere
     # (level 5.2 ceiling) and required for the DeoVR/HLS route.
     [ValidateSet("av1", "h264")]
-    [string]$Codec = "av1"
+    [string]$Codec = "av1",
+    # target bitrate in kbps (also the floor when -MaxBitrate is set).
+    # 0 = codec default (av1: 150000, h264: 80000)
+    [int]$Bitrate = 0,
+    # optional ceiling in kbps: when > Bitrate, the encoder runs VBR between
+    # the two; omitted = constant bitrate at -Bitrate
+    [int]$MaxBitrate = 0,
+    # skip the bandwidth monitor window
+    [switch]$NoMonitor
 )
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
@@ -26,8 +34,9 @@ $root = $PSScriptRoot
 $fps = 72
 # av1: 6144x3072@72 = 1.36 Gpx/s, ~68% of the Quest 3 decoder's rated 8K60 budget
 # h264: Meta browser caps H.264 at 4K; 3840x1920@72 is also the level 5.2 ceiling
-if ($Codec -eq "av1") { $canvasW = 6144; $canvasH = 3072; $encoderId = "obs_nvenc_av1_tex" }
-else                  { $canvasW = 3840; $canvasH = 1920; $encoderId = "obs_nvenc_h264_tex" }
+if ($Codec -eq "av1") { $canvasW = 6144; $canvasH = 3072; $encoderId = "obs_nvenc_av1_tex"; $defBitrate = 150000 }
+else                  { $canvasW = 3840; $canvasH = 1920; $encoderId = "obs_nvenc_h264_tex"; $defBitrate = 80000 }
+if ($Bitrate -le 0) { $Bitrate = $defBitrate }
 
 # ---- first-run provisioning ----------------------------------------------------
 if (-not (Test-Path "$root\bin\VR180Mirror.exe")) {
@@ -60,7 +69,13 @@ if (-not $ourObs) {
                 -replace "FPSInt=\d+", "FPSInt=$fps" -replace "Encoder=obs_nvenc_\w+_tex", "Encoder=$encoderId"
     [IO.File]::WriteAllText("$profDir\basic.ini", $ini, $utf8)
     Copy-Item "$root\obs\service.json" $profDir -Force
-    Copy-Item "$root\obs\streamEncoder.$Codec.json" "$profDir\streamEncoder.json" -Force
+    $enc = Get-Content "$root\obs\streamEncoder.$Codec.json" -Raw | ConvertFrom-Json
+    $enc.bitrate = $Bitrate
+    if ($MaxBitrate -gt $Bitrate) {
+        $enc.rate_control = "VBR"
+        $enc | Add-Member -NotePropertyName max_bitrate -NotePropertyValue $MaxBitrate -Force
+    }
+    [IO.File]::WriteAllText("$profDir\streamEncoder.json", ($enc | ConvertTo-Json -Compress), $utf8)
     $scene = Get-Content "$root\obs\scene-collection.json" -Raw | ConvertFrom-Json
     $item = ($scene.sources | Where-Object { $_.id -eq "scene" }).settings.items[0]
     $item.scale_ref.x = $canvasW; $item.scale_ref.y = $canvasH
@@ -188,6 +203,18 @@ if (-not $NoOBS) {
             -ArgumentList "--multi","--only-bundled-plugins","--disable-shutdown-check",
                           "--profile","VR180Mirror","--collection","VR180Mirror",
                           "--startstreaming","--minimize-to-tray"
+    }
+}
+
+# ---- bandwidth monitor (optional; close its window or use -NoMonitor) -----------
+if (-not $NoMonitor) {
+    if (-not (Test-Path "$root\tools\BandwidthMonitor.exe")) {
+        try { & "$root\tools\build-monitor.ps1" } catch { Write-Host "monitor build failed: $_" }
+    }
+    if ((Test-Path "$root\tools\BandwidthMonitor.exe") -and
+        -not (Get-CimInstance Win32_Process -Filter "Name = 'BandwidthMonitor.exe'")) {
+        Start-Process "$root\tools\BandwidthMonitor.exe" -WorkingDirectory "$root\tools"
+        Write-Host "Bandwidth monitor opened (close it anytime; -NoMonitor to skip)"
     }
 }
 

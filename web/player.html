@@ -56,6 +56,7 @@
     <label class="chk"><input type="checkbox" id="headlock"> Hard-lock to player's view (no free look)</label>
     <label class="chk"><input type="checkbox" id="muted" checked> Muted</label>
     <label class="chk" title="Removes the soft fade at the image border so the full rendered picture is visible. Any rounded corners that remain come from the game itself (pixels behind the lens mask are never rendered)."><input type="checkbox" id="fullpic"> Full picture (no edge softening)</label>
+    <label class="chk" title="Buffers ~1.5s so every frame plays at a constant 72fps even through hiccups — frames are delayed, never skipped. Adds latency."><input type="checkbox" id="delaypref"> Prefer delaying over skipping</label>
   </div>
   <div id="status2" style="color:#9aa0a6;font-size:.95rem"></div>
   <div id="stats"></div>
@@ -87,6 +88,7 @@ async function whepConnect() {
   pc.ontrack = (ev) => {
     stream.addTrack(ev.track);
     if (video.srcObject !== stream) video.srcObject = stream;
+    applyDelayPref();
   };
   pc.onconnectionstatechange = () => {
     setStatus("WebRTC: " + pc.connectionState);
@@ -276,6 +278,20 @@ setInterval(async () => {
   } catch (e) { /* probe unavailable; ignore */ }
 })();
 
+// "Prefer delaying over skipping": raise the WebRTC jitter-buffer target so
+// late frames wait in the buffer instead of being dropped. Combined with the
+// USB path's TCP transport (lossless), hiccups become latency, not skips.
+const DELAY_TARGET_MS = 1500;
+function applyDelayPref() {
+  if (!pc) return;
+  const target = $("delaypref").checked ? DELAY_TARGET_MS : 0;
+  for (const r of pc.getReceivers()) {
+    try { r.jitterBufferTarget = target; } catch (e) {}
+    try { r.playoutDelayHint = target / 1000; } catch (e) {}   // older Chromium name
+  }
+}
+$("delaypref").addEventListener("change", applyDelayPref);
+
 // "Full picture" toggles the PC-side edge feather via the /settings bridge.
 const FEATHER_DEFAULT = 1.5;
 async function pushFullpic() {
@@ -304,6 +320,7 @@ fetch(new URL("/settings", location.href)).then((r) => r.json()).then((s) => {
     $("fullpic").checked = q.get("fullpic") === "1";
     pushFullpic();
   }
+  if (q.has("delay")) $("delaypref").checked = q.get("delay") === "1";
   if (q.get("auto") === "1") setTimeout(() => $("connect").click(), 400);
 }
 

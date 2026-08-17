@@ -132,8 +132,16 @@ Ports (chosen to coexist with other streaming stacks): 8443, 9080, 9888, 9889/TC
   use it for DeoVR or non-Quest-3 viewers. The launcher syncs the OBS profile/canvas
   automatically at each start (while OBS is closed). Verified sustained on an RTX 5090
   (719 frames / 10.0 s, 150.1 Mb/s measured).
-- **Bitrate**: OBS → Settings → Output → Streaming (AV1 150 Mbps / H264 80 Mbps defaults; USB or
-  wired LAN handles it — drop to 40-60 on marginal Wi-Fi).
+- **Bitrate**: launcher flags — `-Bitrate <kbps>` (target; also the floor) and optional
+  `-MaxBitrate <kbps>` (ceiling; when set above the target the encoder runs VBR between the two,
+  otherwise constant bitrate). Defaults: AV1 150 Mbps CBR / H264 80 Mbps CBR.
+- **Prefer delaying over skipping**: viewer-side checkbox (page + Quest app). Raises the WebRTC
+  jitter-buffer target to ~1.5 s so every frame plays at a constant 72 fps — hiccups become
+  latency, never dropped frames (the USB path's TCP transport is already lossless).
+- **Bandwidth monitor** (optional): `tools\BandwidthMonitor.exe` opens with the launcher — live
+  delivered-vs-configured bitrate, per-viewer USB/LAN detection, NIC headroom, 2-minute graph.
+  Close it anytime or start with `-NoMonitor`. Rebuild: `tools\build-monitor.ps1` (built-in
+  .NET Framework compiler, no SDK).
 - **Supersampled source**: Virtual Desktop Godlike renders 3072×3216 per eye on Quest 3 (a 1.46×
   linear supersample of the 2064×2208 panel); the reprojection box-filters it with a 2×2
   supersampling tap (`--no-ss` disables) so the downsample to the stream happens once, cleanly,
