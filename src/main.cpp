@@ -72,6 +72,42 @@ struct Config {
 static Config g_cfg;
 static bool   g_quit = false;
 
+static void logf(const char* fmt, ...);
+
+// ----------------------------------------------------------------------------
+// Runtime settings file: bin\runtime.json, written by the web server when the
+// viewer toggles options (e.g. "full picture" = feather 0). Polled ~1x/s.
+// ----------------------------------------------------------------------------
+static FILETIME g_rtWriteTime = {};
+static void pollRuntimeFile() {
+    static char path[MAX_PATH] = {};
+    if (!path[0]) {
+        GetModuleFileNameA(nullptr, path, MAX_PATH);
+        char* slash = strrchr(path, '\\');
+        if (slash) strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "runtime.json");
+    }
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) return;
+    if (CompareFileTime(&fad.ftLastWriteTime, &g_rtWriteTime) == 0) return;
+    g_rtWriteTime = fad.ftLastWriteTime;
+
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "rb") != 0 || !f) return;
+    char buf[512] = {};
+    fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    const char* k = strstr(buf, "\"feather\"");
+    if (k) {
+        float v = -1.0f;
+        if (sscanf_s(k + 9, " : %f", &v) == 1 && v >= 0.0f && v <= 20.0f) {
+            if (v != g_cfg.featherDeg) {
+                g_cfg.featherDeg = v;
+                logf("runtime.json: feather -> %.2f deg%s", v, v == 0.0f ? " (full picture)" : "");
+            }
+        }
+    }
+}
+
 static void logf(const char* fmt, ...) {
     char buf[1024];
     va_list ap; va_start(ap, fmt);
@@ -651,6 +687,9 @@ int main(int argc, char** argv) {
             DispatchMessageW(&msg);
         }
         if (g_quit) break;
+
+        static int rtCounter = 0;
+        if (++rtCounter >= g_cfg.fps) { rtCounter = 0; pollRuntimeFile(); }
 
         vrPump();
 

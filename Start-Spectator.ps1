@@ -191,6 +191,24 @@ if (-not $NoOBS) {
     }
 }
 
+# ---- USB spectator: re-establish adb reverse tunnels if a headset is plugged ----
+$adb = (Get-Command adb -ErrorAction SilentlyContinue).Source
+if (-not $adb) {
+    $adb = Get-ChildItem "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe",
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Google.PlatformTools*\platform-tools\adb.exe" `
+        -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+}
+if ($adb) {
+    try {
+        $dev = (& $adb devices) -split "`n" | Select-Object -Skip 1 | Where-Object { $_ -match "\tdevice$" }
+        if (@($dev).Count -eq 1) {
+            & $adb reverse tcp:9080 tcp:9080 | Out-Null
+            & $adb reverse tcp:9189 tcp:9189 | Out-Null
+            Write-Host "USB spectator tunnels active (adb reverse 9080 + 9189)"
+        }
+    } catch { }
+}
+
 # ---- summary -----------------------------------------------------------------------
 Write-Host ""
 Write-Host "================= VR180 SPECTATOR READY ================="  -ForegroundColor Green

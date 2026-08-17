@@ -55,6 +55,7 @@
     <button id="enter-vr" disabled>🥽 Enter VR (180° immersive)</button>
     <label class="chk"><input type="checkbox" id="headlock"> Hard-lock to player's view (no free look)</label>
     <label class="chk"><input type="checkbox" id="muted" checked> Muted</label>
+    <label class="chk" title="Removes the soft fade at the image border so the full rendered picture is visible. Any rounded corners that remain come from the game itself (pixels behind the lens mask are never rendered)."><input type="checkbox" id="fullpic"> Full picture (no edge softening)</label>
   </div>
   <div id="status2" style="color:#9aa0a6;font-size:.95rem"></div>
   <div id="stats"></div>
@@ -274,6 +275,37 @@ setInterval(async () => {
       : "not supported — restart the PC pipeline with -Codec h264");
   } catch (e) { /* probe unavailable; ignore */ }
 })();
+
+// "Full picture" toggles the PC-side edge feather via the /settings bridge.
+const FEATHER_DEFAULT = 1.5;
+async function pushFullpic() {
+  try {
+    await fetch(new URL("/settings", location.href), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ feather: $("fullpic").checked ? 0 : FEATHER_DEFAULT }),
+    });
+  } catch (e) {}
+}
+$("fullpic").addEventListener("change", pushFullpic);
+fetch(new URL("/settings", location.href)).then((r) => r.json()).then((s) => {
+  if (typeof s.feather === "number") $("fullpic").checked = s.feather === 0;
+}).catch(() => {});
+
+// Launcher-app presets: ?auto=1&headlock=0|1&muted=0|1&fullpic=0|1 (set by the Quest APK)
+{
+  const q = new URLSearchParams(location.search);
+  if (q.has("headlock")) $("headlock").checked = q.get("headlock") === "1";
+  if (q.has("muted")) {
+    $("muted").checked = q.get("muted") !== "0";
+    video.muted = $("muted").checked;
+  }
+  if (q.has("fullpic")) {
+    $("fullpic").checked = q.get("fullpic") === "1";
+    pushFullpic();
+  }
+  if (q.get("auto") === "1") setTimeout(() => $("connect").click(), 400);
+}
 
 window.addEventListener("beforeunload", () => {
   if (whepLocation) navigator.sendBeacon && fetch(whepLocation, { method: "DELETE", keepalive: true }).catch(() => {});

@@ -62,7 +62,26 @@ The capture reads the **SteamVR compositor**, so the game must run through Steam
 - **Steam Link**: nothing to do (always SteamVR; set SteamVR as the OpenXR runtime if asked).
 - **Link cable / Air Link**: launch the game in SteamVR mode (OpenVR titles do this automatically).
 
-## Spectator headset — three ways to watch (same Wi-Fi as the PC)
+## Quest launcher app (recommended): `quest-app\VR180Spectator.apk`
+
+A tiny sideloaded 2D app for the spectator Quest — **USB-cable only, by design** (the cable is
+the only transport that guarantees the max-quality 150 Mbps stream; if the tunnel isn't up, the
+app says so instead of silently degrading to Wi-Fi). It checks the adb-reverse tunnel every 2 s,
+shows PC/stream status (live, codec tracks), remembers three checkboxes — **Hard-lock view**,
+**Start muted**, **Full picture (no edge softening)** — and one WATCH button opens the WebXR
+viewer with everything pre-applied (one more click inside: Enter VR).
+
+- Install once: `adb install -r quest-app\VR180Spectator.apk` (or drag into SideQuest).
+  Appears under Library → Unknown Sources as "VR180 Spectator".
+- Rebuild: `quest-app\build-apk.ps1` (raw aapt2/d8/apksigner toolchain — no Gradle).
+- The "Full picture" toggle is live: the viewer posts it to `/settings`, the web server writes
+  `bin\runtime.json`, and VR180Mirror.exe applies it within a second (it removes the edge-fade
+  feather; any rounded corners that remain are the game's own lens mask — those pixels are never
+  rendered by the game and cannot be recovered).
+- `Start-Spectator.ps1` auto-establishes the adb-reverse tunnels when it finds exactly one
+  headset connected; re-run it (or `Connect-SpectatorUSB.ps1`) after re-plugging the cable.
+
+## Spectator headset — browser routes (no app needed)
 
 | Route | Latency | Setup |
 |---|---|---|

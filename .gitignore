@@ -11,3 +11,5 @@ tools/mediamtx/LICENSE
 web/key.pem
 web/cert.pem
 tools/mediamtx.zip
+quest-app/build/
+bin/runtime.json

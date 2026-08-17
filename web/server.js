@@ -116,13 +116,61 @@ function proxyWhep(req, res) {
   });
 }
 
+// ---- runtime settings bridge ---------------------------------------------------
+// The viewer toggles stream-side options (edge feather / "full picture"); we
+// persist them to bin\runtime.json, which VR180Mirror.exe watches live.
+const RUNTIME_FILE = path.join(ROOT, "..", "bin", "runtime.json");
+function settings(req, res) {
+  if (req.method === "POST") {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+        const out = {};
+        if (typeof body.feather === "number" && body.feather >= 0 && body.feather <= 20) {
+          out.feather = body.feather;
+        }
+        fs.writeFileSync(RUNTIME_FILE, JSON.stringify(out));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(out));
+      } catch (e) {
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("bad settings body");
+      }
+    });
+    return;
+  }
+  let cur = {};
+  try { cur = JSON.parse(fs.readFileSync(RUNTIME_FILE, "utf8")); } catch (e) {}
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(cur));
+}
+
 function handler(req, res) {
   const u = new URL(req.url, "http://x");
   if (u.pathname === "/whep" || u.pathname.startsWith("/whep-res/")) return proxyWhep(req, res);
+  if (u.pathname === "/settings") return settings(req, res);
   if (u.pathname === "/deovr" || u.pathname === "/deovr.json") return deovr(req, res);
   if (u.pathname === "/info") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ lanIp, stream: STREAM_PATH }));
+    // Enriched status for the Quest launcher app: is the ingest live, which codec.
+    const send = (extra) => {
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ app: "vr180mirror", lanIp, stream: STREAM_PATH,
+        httpsPort: HTTPS_PORT, httpPort: HTTP_PORT, ...extra }));
+    };
+    const req2 = http.get("http://127.0.0.1:9998/v3/paths/list", { timeout: 1500 }, (r2) => {
+      let body = "";
+      r2.on("data", (c) => (body += c));
+      r2.on("end", () => {
+        try {
+          const item = (JSON.parse(body).items || []).find((i) => i.name === STREAM_PATH);
+          send({ ready: !!(item && item.ready), tracks: item ? item.tracks : [] });
+        } catch (e) { send({ ready: false, tracks: [] }); }
+      });
+    });
+    req2.on("error", () => send({ ready: false, tracks: [] }));
+    req2.on("timeout", () => { req2.destroy(); send({ ready: false, tracks: [] }); });
     return;
   }
   return serveStatic(req, res, u.pathname);
