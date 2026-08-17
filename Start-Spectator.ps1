@@ -126,7 +126,7 @@ if (Get-OurProcess "mediamtx.exe" "VR180Mirror") {
     if (Test-Listening 9889) { throw "Port 9889 is already in use by something else" }
     Start-Process -FilePath "$root\tools\mediamtx\mediamtx.exe" `
         -ArgumentList "`"$root\tools\mediamtx\mediamtx.yml`"" `
-        -WorkingDirectory "$root\tools\mediamtx" -WindowStyle Minimized
+        -WorkingDirectory "$root\tools\mediamtx" -WindowStyle Hidden
     Write-Host "MediaMTX started (WHIP/WHEP :9889, LL-HLS :9888)"
 }
 
@@ -135,7 +135,8 @@ if (Get-OurProcess "node.exe" "VR180Mirror\web\server.js") {
     Write-Host "Web server already running"
 } else {
     Start-Process -FilePath "node" -ArgumentList "`"$root\web\server.js`"","--ip",$lanIp `
-        -WorkingDirectory "$root\web" -WindowStyle Minimized
+        -WorkingDirectory "$root\web" -WindowStyle Hidden `
+        -RedirectStandardOutput "$root\web\server.log" -RedirectStandardError "$root\web\server.err.log"
     Write-Host "Web server started (https :8443, http :9080)"
 }
 
