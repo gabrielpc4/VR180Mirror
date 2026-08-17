@@ -1,0 +1,13 @@
+# build outputs & test artifacts
+bin/
+
+# fetched dependencies (build.ps1 / Start-Spectator.ps1 re-fetch them)
+third_party/
+tools/mediamtx/mediamtx.exe
+tools/mediamtx/mediamtx.zip
+tools/mediamtx/LICENSE
+
+# local TLS material - never commit private keys
+web/key.pem
+web/cert.pem
+tools/mediamtx.zip

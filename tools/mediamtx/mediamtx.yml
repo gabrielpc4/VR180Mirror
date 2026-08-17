@@ -1,0 +1,48 @@
+# MediaMTX config for VR180Mirror
+# Ingest:  OBS publishes WHIP (WebRTC) to http://127.0.0.1:9889/vr180/whip
+# Outputs: WHEP (WebRTC)  http://127.0.0.1:9889/vr180/whep  (proxied by web/server.js on :8443)
+#          LL-HLS         http://<lan-ip>:9888/vr180/index.m3u8  (DeoVR fallback)
+# Ports chosen to coexist with any other streaming stack on this PC
+# (8889/8189/8554/1935/8080 are left alone).
+
+logLevel: info
+logDestinations: [stdout]
+
+# large socket buffer: the local WHIP publisher bursts RTP packets; avoid drops
+udpReadBufferSize: 4194304
+
+api: false
+rtsp: false
+rtmp: false
+srt: false
+moq: false
+playback: false
+metrics: false
+pprof: false
+
+webrtc: true
+# bound on all interfaces so the Quest can also use MediaMTX's built-in page
+# (http://<lan-ip>:9889/vr180) with the browser's fullscreen 180/3D mode
+webrtcAddress: :9889
+webrtcEncryption: false
+webrtcAllowOrigins: ["*"]
+webrtcLocalUDPAddress: :9189
+# Advertise loopback (for local OBS publisher) + the LAN IP (for the Quest).
+# Start-Spectator.ps1 rewrites the LAN entry to the current address on launch.
+webrtcIPsFromInterfaces: false
+webrtcAdditionalHosts: [127.0.0.1, 192.168.0.4]
+
+hls: true
+hlsAddress: :9888
+hlsEncryption: false
+hlsAllowOrigins: ["*"]
+hlsVariant: lowLatency
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+hlsAlwaysRemux: true
+
+paths:
+  vr180:
+    source: publisher
+

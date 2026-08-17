@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VR180 Spectator</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0b0d10; color: #e8eaed;
+    font-family: system-ui, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; gap: 16px; padding: 20px;
+  }
+  h1 { font-size: 1.15rem; font-weight: 600; margin-top: 4px; letter-spacing: .3px; }
+  h1 .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+    background: #666; margin-right: 8px; transition: background .3s; }
+  h1 .dot.live { background: #34c759; box-shadow: 0 0 8px #34c75988; }
+  #video-wrap { width: min(96vw, 1100px); aspect-ratio: 2 / 1; background: #000;
+    border: 1px solid #26292e; border-radius: 10px; overflow: hidden; position: relative; }
+  video { width: 100%; height: 100%; object-fit: contain; }
+  #overlay { position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 10px;
+    background: #000a; backdrop-filter: blur(2px); }
+  #overlay.hidden { display: none; }
+  button {
+    font: inherit; font-weight: 600; color: #fff; background: #2a6df4;
+    border: 0; border-radius: 10px; padding: 14px 26px; cursor: pointer;
+    font-size: 1.05rem;
+  }
+  button:disabled { background: #333; color: #888; }
+  button.big { font-size: 1.3rem; padding: 18px 40px; }
+  #enter-vr { background: #7b2af4; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; align-items: center; }
+  #status { color: #9aa0a6; font-size: .95rem; min-height: 1.2em; text-align: center; }
+  label.chk { display: flex; gap: 8px; align-items: center; color: #c6cad1; font-size: .95rem;
+    background: #16181c; padding: 10px 14px; border-radius: 10px; border: 1px solid #26292e;
+    cursor: pointer; user-select: none; }
+  #stats { color: #6f757d; font-size: .8rem; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+  <h1><span id="dot" class="dot"></span>VR180 Spectator — live view of the player's headset</h1>
+
+  <div id="video-wrap">
+    <video id="video" playsinline muted></video>
+    <div id="overlay">
+      <button id="connect" class="big">▶ Connect to stream</button>
+      <div id="status">Not connected</div>
+    </div>
+  </div>
+
+  <div class="row">
+    <button id="enter-vr" disabled>🥽 Enter VR (180° immersive)</button>
+    <label class="chk"><input type="checkbox" id="headlock"> Hard-lock to player's view (no free look)</label>
+    <label class="chk"><input type="checkbox" id="muted" checked> Muted</label>
+  </div>
+  <div id="status2" style="color:#9aa0a6;font-size:.95rem"></div>
+  <div id="stats"></div>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const video = $("video");
+const statusEl = $("status");
+const status2El = $("status2");
+
+let pc = null;
+let whepLocation = null;
+let xrSession = null;
+let connected = false;
+
+function setStatus(t) { statusEl.textContent = t; status2El.textContent = t; }
+
+// ---------------------------------------------------------------- WHEP client
+async function whepConnect() {
+  const whepUrl = new URL("/whep", location.href).href;
+  pc = new RTCPeerConnection();
+  pc.addTransceiver("video", { direction: "recvonly" });
+  pc.addTransceiver("audio", { direction: "recvonly" });
+
+  const stream = new MediaStream();
+  pc.ontrack = (ev) => {
+    stream.addTrack(ev.track);
+    if (video.srcObject !== stream) video.srcObject = stream;
+  };
+  pc.onconnectionstatechange = () => {
+    setStatus("WebRTC: " + pc.connectionState);
+    $("dot").classList.toggle("live", pc.connectionState === "connected");
+    if (pc.connectionState === "connected") {
+      connected = true;
+      $("overlay").classList.add("hidden");
+      updateVRButton();
+    }
+    if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
+      connected = false;
+      $("overlay").classList.remove("hidden");
+      $("connect").textContent = "▶ Reconnect";
+      $("connect").disabled = false;
+      updateVRButton();
+    }
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await new Promise((res) => {
+    if (pc.iceGatheringState === "complete") return res();
+    const chk = () => { if (pc.iceGatheringState === "complete") { pc.removeEventListener("icegatheringstatechange", chk); res(); } };
+    pc.addEventListener("icegatheringstatechange", chk);
+    setTimeout(res, 1500);
+  });
+
+  const resp = await fetch(whepUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/sdp" },
+    body: pc.localDescription.sdp,
+  });
+  if (!resp.ok && resp.status !== 201) throw new Error("WHEP POST failed: " + resp.status);
+  whepLocation = resp.headers.get("Location");
+  const answer = await resp.text();
+  await pc.setRemoteDescription({ type: "answer", sdp: answer });
+}
+
+$("connect").addEventListener("click", async () => {
+  $("connect").disabled = true;
+  setStatus("Connecting…");
+  try {
+    await whepConnect();
+    video.muted = $("muted").checked;
+    await video.play().catch(() => {});
+  } catch (e) {
+    setStatus("Failed: " + e.message + " — is the PC pipeline running?");
+    $("connect").disabled = false;
+  }
+});
+
+$("muted").addEventListener("change", () => { video.muted = $("muted").checked; });
+
+// ---------------------------------------------------------------- WebXR VR180
+const XR_HAVE = "xr" in navigator;
+
+async function updateVRButton() {
+  const btn = $("enter-vr");
+  if (!XR_HAVE) {
+    btn.textContent = window.isSecureContext
+      ? "WebXR not available in this browser"
+      : "WebXR blocked: page not a secure context";
+    btn.disabled = true;
+    return;
+  }
+  const ok = await navigator.xr.isSessionSupported("immersive-vr").catch(() => false);
+  btn.disabled = !(ok && connected);
+  btn.textContent = ok ? "🥽 Enter VR (180° immersive)" : "immersive-vr not supported here";
+}
+updateVRButton();
+
+$("enter-vr").addEventListener("click", async () => {
+  if (xrSession) { xrSession.end(); return; }
+  try {
+    xrSession = await navigator.xr.requestSession("immersive-vr", {
+      requiredFeatures: ["layers"],
+      optionalFeatures: ["local-floor"],
+    });
+  } catch (e) {
+    setStatus("XR session failed: " + e.message);
+    return;
+  }
+  $("enter-vr").textContent = "Exit VR";
+
+  const refSpace = await xrSession.requestReferenceSpace("local");
+  const mediaBinding = new XRMediaBinding(xrSession);
+
+  // VR180: stereo left-right halves, 180 deg horizontal, full vertical
+  const layer = mediaBinding.createEquirectLayer(video, {
+    space: refSpace,
+    layout: "stereo-left-right",
+    centralHorizontalAngle: Math.PI,
+    upperVerticalAngle: Math.PI / 2,
+    lowerVerticalAngle: -Math.PI / 2,
+    radius: 0,           // infinite-ish dome
+  });
+
+  // A tiny WebGL layer is still required as the session's base render state
+  // on some runtimes; give it a transparent projection layer under the media.
+  const canvas = document.createElement("canvas");
+  const gl = canvas.getContext("webgl2", { xrCompatible: true, alpha: true });
+  await gl.makeXRCompatible();
+  const glBinding = new XRWebGLBinding(xrSession, gl);
+  const projLayer = glBinding.createProjectionLayer({ alpha: true });
+  xrSession.updateRenderState({ layers: [layer, projLayer] });
+
+  video.play().catch(() => {});
+
+  const headlock = () => $("headlock").checked;
+  const onFrame = (t, frame) => {
+    xrSession.requestAnimationFrame(onFrame);
+    const pose = frame.getViewerPose(refSpace);
+    // keep the base projection layer transparent
+    if (pose) {
+      for (const view of pose.views) {
+        const sub = glBinding.getViewSubImage(projLayer, view);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, sub.framebuffer);
+        const vp = sub.viewport;
+        gl.viewport(vp.x, vp.y, vp.width, vp.height);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      }
+    }
+    // Hard-lock mode: glue the dome to the viewer's head every frame,
+    // so the spectator sees EXACTLY the player's framing at all times.
+    if (pose && headlock()) {
+      layer.transform = new XRRigidTransform(
+        { x: 0, y: 0, z: 0 },
+        pose.transform.orientation
+      );
+    } else if (!headlock() && layer.transform &&
+               (layer.transform.orientation.x !== 0 || layer.transform.orientation.y !== 0 ||
+                layer.transform.orientation.z !== 0 || layer.transform.orientation.w !== 1)) {
+      layer.transform = new XRRigidTransform({ x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 0, w: 1 });
+    }
+  };
+  xrSession.requestAnimationFrame(onFrame);
+
+  xrSession.addEventListener("end", () => {
+    xrSession = null;
+    $("enter-vr").textContent = "🥽 Enter VR (180° immersive)";
+    updateVRButton();
+  });
+});
+
+// ---------------------------------------------------------------- stats
+setInterval(async () => {
+  if (!pc || pc.connectionState !== "connected") { $("stats").textContent = ""; return; }
+  const st = await pc.getStats();
+  let fps = 0, w = 0, h = 0, kbps = 0;
+  st.forEach((r) => {
+    if (r.type === "inbound-rtp" && r.kind === "video") {
+      fps = r.framesPerSecond || 0;
+      w = r.frameWidth || 0; h = r.frameHeight || 0;
+      if (r._prevBytes !== undefined) {} // n/a
+      kbps = Math.round(((r.bytesReceived - (window._pb || 0)) * 8) / 1000);
+      window._pb = r.bytesReceived;
+    }
+  });
+  $("stats").textContent = `${w}x${h} @ ${fps}fps · ${kbps} kbit/s`;
+}, 1000);
+
+window.addEventListener("beforeunload", () => {
+  if (whepLocation) navigator.sendBeacon && fetch(whepLocation, { method: "DELETE", keepalive: true }).catch(() => {});
+});
+</script>
+</body>
+</html>
