@@ -155,7 +155,7 @@
                         "id":  "game_capture",
                         "versioned_id":  "game_capture",
                         "settings":  {
-                                         "window":  "VR180Mirror â€” SBS half 180 â€” waiting for SteamVR:VR180MirrorWnd:VR180Mirror.exe",
+                                         "window":  "VR180Mirror - SBS half 180 - waiting for SteamVR:VR180MirrorWnd:VR180Mirror.exe",
                                          "capture_mode":  "window",
                                          "priority":  2,
                                          "capture_cursor":  false,

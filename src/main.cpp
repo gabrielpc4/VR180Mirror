@@ -598,7 +598,7 @@ int main(int argc, char** argv) {
     RECT r{ 0, 0, pw, ph };
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     HWND hwnd = CreateWindowExW(g_cfg.topmost ? WS_EX_TOPMOST : 0, wc.lpszClassName,
-        L"VR180Mirror — SBS half 180 — waiting for SteamVR",
+        L"VR180Mirror - SBS half 180 - waiting for SteamVR",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         60, 60, r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
     if (!hwnd) { logf("CreateWindow failed"); return 1; }
@@ -698,8 +698,8 @@ int main(int argc, char** argv) {
             wasLive = live;
             logf(live ? "LIVE: mirroring headset view" : "Idle: showing grid (no headset feed)");
             SetWindowTextW(hwnd, live
-                ? L"VR180Mirror — LIVE — SBS half 180"
-                : L"VR180Mirror — SBS half 180 — waiting for SteamVR");
+                ? L"VR180Mirror - LIVE - SBS half 180"
+                : L"VR180Mirror - SBS half 180 - waiting for SteamVR");
         }
 
         QueryPerformanceCounter(&qpc);
