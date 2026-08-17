@@ -12,6 +12,7 @@ if (-not (Test-Path "$env:APPDATA\obs-studio")) {
 }
 
 New-Item -ItemType Directory -Force $profileDir | Out-Null
-Copy-Item "$src\basic.ini","$src\service.json","$src\streamEncoder.json" $profileDir -Force
+Copy-Item "$src\basic.ini","$src\service.json" $profileDir -Force
+Copy-Item "$src\streamEncoder.av1.json" "$profileDir\streamEncoder.json" -Force
 Copy-Item "$src\scene-collection.json" $sceneFile -Force
 Write-Host "Installed OBS profile 'VR180Mirror' and scene collection 'VR180Mirror'."

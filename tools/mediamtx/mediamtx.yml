@@ -11,7 +11,9 @@ logDestinations: [stdout]
 # large socket buffer: the local WHIP publisher bursts RTP packets; avoid drops
 udpReadBufferSize: 4194304
 
-api: false
+# local-only control API - used by Start-Spectator.ps1 to health-check ingest
+api: true
+apiAddress: 127.0.0.1:9998
 rtsp: false
 rtmp: false
 srt: false
@@ -27,6 +29,9 @@ webrtcAddress: :9889
 webrtcEncryption: false
 webrtcAllowOrigins: ["*"]
 webrtcLocalUDPAddress: :9189
+# ICE over TCP on the same port: lets the USB-cable spectator route WebRTC
+# media through an adb-reverse tunnel (Quest -> localhost -> PC), bypassing Wi-Fi
+webrtcLocalTCPAddress: :9189
 # Advertise loopback (for local OBS publisher) + the LAN IP (for the Quest).
 # Start-Spectator.ps1 rewrites the LAN entry to the current address on launch.
 webrtcIPsFromInterfaces: false

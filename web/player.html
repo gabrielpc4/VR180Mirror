@@ -58,6 +58,7 @@
   </div>
   <div id="status2" style="color:#9aa0a6;font-size:.95rem"></div>
   <div id="stats"></div>
+  <div id="cap" style="color:#6f757d;font-size:.8rem"></div>
 
 <script>
 "use strict";
@@ -119,7 +120,13 @@ async function whepConnect() {
   });
   if (!resp.ok && resp.status !== 201) throw new Error("WHEP POST failed: " + resp.status);
   whepLocation = resp.headers.get("Location");
-  const answer = await resp.text();
+  let answer = await resp.text();
+  // USB mode: page served via adb-reverse on localhost. Keep only loopback ICE
+  // candidates so the media is forced through the USB tunnel instead of Wi-Fi.
+  if (["localhost", "127.0.0.1"].includes(location.hostname)) {
+    answer = answer.split("\r\n").filter((l) =>
+      !l.startsWith("a=candidate:") || l.includes("127.0.0.1")).join("\r\n");
+  }
   await pc.setRemoteDescription({ type: "answer", sdp: answer });
 }
 
@@ -168,6 +175,12 @@ $("enter-vr").addEventListener("click", async () => {
     return;
   }
   $("enter-vr").textContent = "Exit VR";
+
+  // Match the headset compositor to the 72 fps stream: no 72-in-90 pulldown judder.
+  if (xrSession.supportedFrameRates && xrSession.updateTargetFrameRate) {
+    const rates = Array.from(xrSession.supportedFrameRates);
+    if (rates.includes(72)) xrSession.updateTargetFrameRate(72).catch(() => {});
+  }
 
   const refSpace = await xrSession.requestReferenceSpace("local");
   const mediaBinding = new XRMediaBinding(xrSession);
@@ -246,6 +259,21 @@ setInterval(async () => {
   });
   $("stats").textContent = `${w}x${h} @ ${fps}fps · ${kbps} kbit/s`;
 }, 1000);
+
+// On-device decoder probe: tells the spectator whether this browser hardware-
+// decodes the max-fidelity AV1 stream (Meta recommends the Media Capabilities API).
+(async () => {
+  try {
+    if (!navigator.mediaCapabilities || !navigator.mediaCapabilities.decodingInfo) return;
+    const r = await navigator.mediaCapabilities.decodingInfo({
+      type: "webrtc",
+      video: { contentType: "video/AV1", width: 6144, height: 3072, framerate: 72, bitrate: 150000000 },
+    });
+    $("cap").textContent = "AV1 6144x3072@72 decode: " + (r.supported
+      ? (r.powerEfficient ? "hardware ✓" : "software only — expect stutter; restart the PC pipeline with -Codec h264")
+      : "not supported — restart the PC pipeline with -Codec h264");
+  } catch (e) { /* probe unavailable; ignore */ }
+})();
 
 window.addEventListener("beforeunload", () => {
   if (whepLocation) navigator.sendBeacon && fetch(whepLocation, { method: "DELETE", keepalive: true }).catch(() => {});

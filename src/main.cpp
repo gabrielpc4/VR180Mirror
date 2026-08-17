@@ -64,6 +64,7 @@ struct Config {
     bool     flipV       = false;
     bool     swapEyes    = false;
     bool     topmost     = false;
+    bool     supersample = true;   // 2x2 box taps: cleaner downsample of supersampled mirrors
     float    featherDeg  = 1.5f;
     std::string dumpFrame;
 };
@@ -95,7 +96,7 @@ cbuffer CB : register(b0) {
     row_major float4x4 h2eL;  // head->eye rotation (R_eye2head transposed)
     row_major float4x4 h2eR;
     float4 params0;           // x: feather (tangent units), y: gridMode, z: time s, w: swapEyes
-    float4 params1;           // x: flipV, y,z,w: unused
+    float4 params1;           // x: flipV, y: ss taps (1|4), zw: output pixel in per-eye uv
 };
 
 static const float PI = 3.14159265358979f;
@@ -118,7 +119,7 @@ float3 dirFromEquirect(float2 e) {
     return float3(cl * sin(lon), sin(lat), -cl * cos(lon));
 }
 
-float4 sampleEye(Texture2D tex, float4 tans, float3x3 h2e, float3 dHead) {
+float4 sampleEyeOnce(Texture2D tex, float4 tans, float3x3 h2e, float3 dHead) {
     float3 d = mul(h2e, dHead);
     if (d.z > -1e-4) return float4(0, 0, 0, 1);
     float tx = d.x / -d.z;
@@ -138,6 +139,20 @@ float4 sampleEye(Texture2D tex, float4 tans, float3x3 h2e, float3 dHead) {
     }
     c.a = 1.0;
     return c;
+}
+
+// 2x2 supersampled variant: the mirror is usually higher-res than the output
+// canvas (supersampled render), so box-filtering four sub-pixel rays keeps the
+// downsample clean instead of bilinear-skipping source pixels.
+float4 sampleEye(Texture2D tex, float4 tans, float3x3 h2e, float2 e) {
+    if (params1.y < 1.5) return sampleEyeOnce(tex, tans, h2e, dirFromEquirect(e));
+    float2 px = params1.zw;   // one output pixel in per-eye uv units
+    float4 acc = 0;
+    acc += sampleEyeOnce(tex, tans, h2e, dirFromEquirect(e + px * float2(-0.25, -0.25)));
+    acc += sampleEyeOnce(tex, tans, h2e, dirFromEquirect(e + px * float2( 0.25, -0.25)));
+    acc += sampleEyeOnce(tex, tans, h2e, dirFromEquirect(e + px * float2(-0.25,  0.25)));
+    acc += sampleEyeOnce(tex, tans, h2e, dirFromEquirect(e + px * float2( 0.25,  0.25)));
+    return acc * 0.25;
 }
 
 // Calibration / idle grid: 10-degree lat/long graticule on the 180 dome,
@@ -182,9 +197,8 @@ float4 psmain(VSOut i) : SV_Target {
     float2 e = float2(frac(i.uv.x * 2.0), i.uv.y);
     bool useRight = (params0.w > 0.5) ? !rightHalf : rightHalf;
     if (params0.y > 0.5) return grid(e, useRight);
-    float3 dHead = dirFromEquirect(e);
-    if (useRight) return sampleEye(texR, tanR, (float3x3)h2eR, dHead);
-    return sampleEye(texL, tanL, (float3x3)h2eL, dHead);
+    if (useRight) return sampleEye(texR, tanR, (float3x3)h2eR, e);
+    return sampleEye(texL, tanL, (float3x3)h2eL, e);
 }
 )HLSL";
 
@@ -397,6 +411,9 @@ static void renderFrame(double timeSec) {
     cb.params0[2] = (float)timeSec;
     cb.params0[3] = g_cfg.swapEyes ? 1.0f : 0.0f;
     cb.params1[0] = g_cfg.flipV ? 1.0f : 0.0f;
+    cb.params1[1] = g_cfg.supersample ? 4.0f : 1.0f;
+    cb.params1[2] = 2.0f / g_cfg.width;    // per-eye u units per output pixel
+    cb.params1[3] = 1.0f / g_cfg.height;
 
     D3D11_MAPPED_SUBRESOURCE map;
     if (SUCCEEDED(g.ctx->Map(g.cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
@@ -511,6 +528,7 @@ int main(int argc, char** argv) {
         else if (a == "--flip-v") { g_cfg.flipV = true; }
         else if (a == "--swap-eyes") { g_cfg.swapEyes = true; }
         else if (a == "--topmost") { g_cfg.topmost = true; }
+        else if (a == "--no-ss") { g_cfg.supersample = false; }
         else if (a == "--feather") { g_cfg.featherDeg = (float)atof(next()); }
         else if (a == "--dump-frame") { g_cfg.dumpFrame = next(); }
         else if (a == "--help" || a == "-h") {

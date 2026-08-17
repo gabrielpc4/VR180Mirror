@@ -17,7 +17,7 @@ One PC, two Meta Quest 3 headsets:
                                    projection tangents → SBS half-equirect window
                                                 │
                                                 ▼
-                                   OBS (Game Capture → NVENC H.264 → WHIP)
+                                   OBS (Game Capture → NVENC AV1 72fps → WHIP)
                                                 │
                                                 ▼
                                    MediaMTX     WebRTC (WHEP)  ← ~0.3-0.5 s latency
@@ -30,9 +30,11 @@ One PC, two Meta Quest 3 headsets:
 ## Start / stop
 
 ```powershell
-.\Start-Spectator.ps1            # starts everything (MediaMTX, web server, VR180Mirror, OBS)
-.\Start-Spectator.ps1 -TestGrid  # same, but streams a calibration grid (no SteamVR needed)
-.\Stop-Spectator.ps1             # stops only this pipeline's processes
+.\Start-Spectator.ps1              # starts everything: AV1 6144x3072 @ 72fps, 150 Mbps
+.\Start-Spectator.ps1 -Codec h264  # compatibility mode: H.264 3840x1920 @ 72fps, 80 Mbps
+.\Start-Spectator.ps1 -TestGrid    # same, but streams a calibration grid (no SteamVR needed)
+.\Connect-SpectatorUSB.ps1         # route the stream over the spectator's USB cable (adb reverse)
+.\Stop-Spectator.ps1               # stops only this pipeline's processes
 ```
 
 First run: approve the **UAC prompt** (firewall rules for the spectator's inbound connections)
@@ -64,9 +66,14 @@ The capture reads the **SteamVR compositor**, so the game must run through Steam
 
 | Route | Latency | Setup |
 |---|---|---|
-| **A. WebXR page (recommended)** | ~0.3-0.5 s | Quest Browser → `https://<PC-IP>:8443/` → accept the certificate warning (Advanced → proceed — normal for self-signed, Meta's own documented dev flow) → **Connect to stream** → **Enter VR** |
-| **B. Browser built-in 180 mode (no certificate)** | ~0.3-0.5 s | Quest Browser → `http://<PC-IP>:9889/vr180` → fullscreen the video → in the video controls pick **180°** and **3D left-right** |
-| **C. DeoVR (HLS)** | 2-6 s | DeoVR's browser → `http://<PC-IP>:9080/` (auto-detects the stream as 180° SBS) |
+| **A. USB cable (max quality/reliability)** | ~0.3-0.5 s | Plug the spectator Quest into the PC (USB 3, Developer Mode on), run `Connect-SpectatorUSB.ps1`, then Quest Browser → `http://localhost:9080/` → **Connect** → **Enter VR**. No certificate (localhost is a secure context); the player page pins WebRTC to the loopback tunnel so the video rides the cable, immune to Wi-Fi. |
+| **B. Wi-Fi WebXR page** | ~0.3-0.5 s | Quest Browser → `https://<PC-IP>:8443/` → accept the certificate warning (Advanced → proceed) → **Connect to stream** → **Enter VR** |
+| **C. Browser built-in 180 mode (no certificate)** | ~0.3-0.5 s | Quest Browser → `http://<PC-IP>:9889/vr180` → fullscreen the video → pick **180°** and **3D left-right** in the video controls |
+| **D. DeoVR (HLS)** | 2-6 s | Start with `-Codec h264`, then DeoVR's browser → `http://<PC-IP>:9080/` (auto-detects 180° SBS) |
+
+The WebXR page also requests a **72 Hz** headset refresh so the 72 fps stream plays with perfect
+cadence (no 72-in-90 pulldown). A USB-C-to-Ethernet adapter on the spectator Quest works too
+(no Developer Mode needed) — then just use route B over the wired LAN.
 
 The launcher prints the exact URLs with the PC's current IP.
 
@@ -89,8 +96,8 @@ the dome is world-fixed and the spectator can look around the 180° canvas freel
 | Piece | Where | Job |
 |---|---|---|
 | `bin\VR180Mirror.exe` | built by `build.ps1` from `src\main.cpp` | OpenVR background app: grabs both compositor mirror textures, GPU-reprojects to SBS half-equirect (per-eye raw projection tangents + eye-to-head rotation), presents a 4096×2048 window |
-| OBS profile+collection `VR180Mirror` | templates in `obs\`, installed to `%APPDATA%\obs-studio` | Game Capture of that window → NVENC H.264 4096×2048@60 CBR 40 Mbps → WHIP |
-| `tools\mediamtx\` | MediaMTX v1.20.0 | WebRTC server: WHIP ingest :9889, WHEP out, LL-HLS out :9888, media UDP :9189 |
+| OBS profile+collection `VR180Mirror` | templates in `obs\`, synced to `%APPDATA%\obs-studio` by the launcher | Game Capture of that window → NVENC AV1 6144×3072@72 CBR 150 Mbps → WHIP |
+| `tools\mediamtx\` | MediaMTX v1.20.0 | WebRTC server: WHIP ingest :9889, WHEP out, LL-HLS out :9888, media UDP+TCP :9189 (TCP = USB tunnel), local API :9998 |
 | `web\server.js` | Node | HTTPS :8443 serves the WebXR player + proxies WHEP (single cert acceptance); HTTP :9080 serves the DeoVR JSON |
 | `web\player.html` | | WHEP WebRTC client + WebXR viewer using `XRMediaBinding.createEquirectLayer` (`stereo-left-right`, 180°) — the Quest-accelerated zero-copy video path |
 
@@ -98,10 +105,24 @@ Ports (chosen to coexist with other streaming stacks): 8443, 9080, 9888, 9889/TC
 
 ## Tuning
 
-- **Resolution/fps**: `Start-Spectator.ps1` passes `--size 4096x2048 --fps 60` to VR180Mirror; OBS
-  canvas must match (Settings → Video). 4096×2048\@60 is the H.264 level 5.2 decode ceiling —
-  don't raise fps at this size. For 72 fps use `--size 3072x1536` and set OBS to 72.
-- **Bitrate**: OBS → Settings → Output → Streaming (40 Mbps default; 25-60 sensible on good Wi-Fi).
+- **Resolution/fps/codec**: defaults to **AV1 6144×3072 @ 72 fps, 150 Mbps CBR** (NVENC AV1 →
+  Quest 3 hardware AV1 decode). This is the practical maximum at a constant 72 fps: it consumes
+  ~68% of the Quest 3 decoder's rated 8K60 (~2 Gpx/s) budget, and across the game's ~104° FOV it
+  delivers ~1780 of the spectator panel's 2064 native horizontal pixels (~86%). `-Codec h264`
+  drops to 3840×1920@72 — Meta's browser caps H.264 at 4K and level 5.2 tops out there anyway;
+  use it for DeoVR or non-Quest-3 viewers. The launcher syncs the OBS profile/canvas
+  automatically at each start (while OBS is closed). Verified sustained on an RTX 5090
+  (719 frames / 10.0 s, 150.1 Mb/s measured).
+- **Bitrate**: OBS → Settings → Output → Streaming (AV1 150 Mbps / H264 80 Mbps defaults; USB or
+  wired LAN handles it — drop to 40-60 on marginal Wi-Fi).
+- **Supersampled source**: Virtual Desktop Godlike renders 3072×3216 per eye on Quest 3 (a 1.46×
+  linear supersample of the 2064×2208 panel); the reprojection box-filters it with a 2×2
+  supersampling tap (`--no-ss` disables) so the downsample to the stream happens once, cleanly,
+  on the PC. Streaming the raw supersampled mirror instead would add nothing: the spectator-side
+  decoder is the bottleneck at 72 fps, not the downsample.
+- **If you'd trade fps for pixels**: at 60 fps the decoder budget allows ~7680×3840 (edit `$fps`
+  and the av1 size in `Start-Spectator.ps1`) — that saturates the spectator panel across the
+  game FOV. 72 fps constant is the default per this project's priority.
 - **VR180Mirror flags**: `--swap-eyes` (if stereo feels inverted), `--flip-v` (if image is upside
   down), `--feather <deg>` (edge softening, default 1.5), `--test-grid`, `--preview <px>`,
   `--dump-frame out.bmp` (writes one frame and exits — handy for checks).

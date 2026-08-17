@@ -13,10 +13,21 @@
 # =============================================================================
 param(
     [switch]$TestGrid,
-    [switch]$NoOBS
+    [switch]$NoOBS,
+    # av1 (default): 5120x2560@72, ~25 px/deg - needs the spectator on a Quest 3
+    # (hardware AV1 decode). h264: 3840x1920@72 fallback, works everywhere
+    # (level 5.2 ceiling) and required for the DeoVR/HLS route.
+    [ValidateSet("av1", "h264")]
+    [string]$Codec = "av1"
 )
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
+
+$fps = 72
+# av1: 6144x3072@72 = 1.36 Gpx/s, ~68% of the Quest 3 decoder's rated 8K60 budget
+# h264: Meta browser caps H.264 at 4K; 3840x1920@72 is also the level 5.2 ceiling
+if ($Codec -eq "av1") { $canvasW = 6144; $canvasH = 3072; $encoderId = "obs_nvenc_av1_tex" }
+else                  { $canvasW = 3840; $canvasH = 1920; $encoderId = "obs_nvenc_h264_tex" }
 
 # ---- first-run provisioning ----------------------------------------------------
 if (-not (Test-Path "$root\bin\VR180Mirror.exe")) {
@@ -36,8 +47,30 @@ if (-not (Test-Path "$root\tools\mediamtx\mediamtx.exe")) {
     Remove-Item $zip, $tmp -Recurse -Force -Confirm:$false
     Write-Host "MediaMTX $($rel.tag_name) installed."
 }
-if (-not (Test-Path "$env:APPDATA\obs-studio\basic\profiles\VR180Mirror\basic.ini")) {
-    & "$root\Install-OBSProfile.ps1"
+# ---- sync OBS config to the chosen codec/canvas (skipped while our OBS runs) ----
+$ourObs = Get-CimInstance Win32_Process -Filter "Name = 'obs64.exe'" |
+    Where-Object { $_.CommandLine -like "*--profile VR180Mirror*" }
+if (-not $ourObs) {
+    $profDir = "$env:APPDATA\obs-studio\basic\profiles\VR180Mirror"
+    New-Item -ItemType Directory -Force $profDir | Out-Null
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    $ini = Get-Content "$root\obs\basic.ini" -Raw
+    $ini = $ini -replace "BaseCX=\d+", "BaseCX=$canvasW" -replace "BaseCY=\d+", "BaseCY=$canvasH" `
+                -replace "OutputCX=\d+", "OutputCX=$canvasW" -replace "OutputCY=\d+", "OutputCY=$canvasH" `
+                -replace "FPSInt=\d+", "FPSInt=$fps" -replace "Encoder=obs_nvenc_\w+_tex", "Encoder=$encoderId"
+    [IO.File]::WriteAllText("$profDir\basic.ini", $ini, $utf8)
+    Copy-Item "$root\obs\service.json" $profDir -Force
+    Copy-Item "$root\obs\streamEncoder.$Codec.json" "$profDir\streamEncoder.json" -Force
+    $scene = Get-Content "$root\obs\scene-collection.json" -Raw | ConvertFrom-Json
+    $item = ($scene.sources | Where-Object { $_.id -eq "scene" }).settings.items[0]
+    $item.scale_ref.x = $canvasW; $item.scale_ref.y = $canvasH
+    $item.bounds.x = $canvasW;    $item.bounds.y = $canvasH
+    $scene.resolution.x = $canvasW; $scene.resolution.y = $canvasH
+    [IO.File]::WriteAllText("$env:APPDATA\obs-studio\basic\scenes\VR180Mirror.json",
+        ($scene | ConvertTo-Json -Depth 100), $utf8)
+    Write-Host "OBS config synced: $Codec ${canvasW}x${canvasH}@${fps}"
+} else {
+    Write-Host "OBS already running - config sync skipped (stop it first to change codec/resolution)"
 }
 
 # ---- LAN IP -----------------------------------------------------------------
@@ -110,7 +143,7 @@ if (Get-OurProcess "node.exe" "VR180Mirror\web\server.js") {
 if (Get-OurProcess "VR180Mirror.exe" "VR180Mirror") {
     Write-Host "VR180Mirror already running"
 } else {
-    $mirrorArgs = @("--size","4096x2048","--fps","60","--preview","1280")
+    $mirrorArgs = @("--size","${canvasW}x${canvasH}","--fps","$fps","--preview","1280")
     if ($TestGrid) { $mirrorArgs += "--test-grid" }
     Start-Process -FilePath "$root\bin\VR180Mirror.exe" -ArgumentList $mirrorArgs `
         -WorkingDirectory "$root\bin"
@@ -139,8 +172,9 @@ if (-not $NoOBS) {
     foreach ($i in 1..10) {
         Start-Sleep -Seconds 3
         try {
-            $code = (Invoke-WebRequest "http://127.0.0.1:9888/vr180/index.m3u8" -UseBasicParsing -TimeoutSec 3).StatusCode
-            if ($code -eq 200) { $publishing = $true; break }
+            $paths = Invoke-RestMethod "http://127.0.0.1:9998/v3/paths/list" -TimeoutSec 3
+            $vr = $paths.items | Where-Object { $_.name -eq "vr180" }
+            if ($vr -and $vr.ready) { $publishing = $true; break }
         } catch { }
     }
     if (-not $publishing) {
@@ -161,13 +195,20 @@ if (-not $NoOBS) {
 Write-Host ""
 Write-Host "================= VR180 SPECTATOR READY ================="  -ForegroundColor Green
 Write-Host ""
-Write-Host " On the SPECTATOR Quest (same Wi-Fi):"
+Write-Host " Stream: $Codec ${canvasW}x${canvasH} @ ${fps}fps"
+Write-Host ""
+Write-Host " SPECTATOR via USB cable (max quality/reliability):"
+Write-Host "   plug the spectator Quest into the PC, run .\Connect-SpectatorUSB.ps1,"
+Write-Host "   then open  http://localhost:9080/"                       -ForegroundColor Cyan
+Write-Host "   (no certificate; video rides the cable; Connect -> Enter VR)"
+Write-Host ""
+Write-Host " SPECTATOR via Wi-Fi:"
 Write-Host "   Best (WebXR, ~0.3s):  https://${lanIp}:8443/"           -ForegroundColor Cyan
 Write-Host "     - accept the certificate warning (Advanced -> proceed)"
 Write-Host "     - tap 'Connect to stream', then 'Enter VR'"
 Write-Host "   No-cert fallback:     http://${lanIp}:9889/vr180"        -ForegroundColor Cyan
 Write-Host "     - fullscreen the video, set 180 + 3D left-right in the video bar"
-Write-Host "   DeoVR (HLS, 2-6s):    open  http://${lanIp}:9080/  in DeoVR"
+Write-Host "   DeoVR (HLS, 2-6s):    http://${lanIp}:9080/  in DeoVR (start with -Codec h264)"
 Write-Host ""
 Write-Host " On the PLAYER Quest: play PCVR through SteamVR"
 Write-Host "   (Virtual Desktop: set Streaming > OpenXR runtime = SteamVR)"
