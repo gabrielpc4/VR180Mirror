@@ -3,9 +3,53 @@
 The spectator viewer currently runs as a page in the Quest's Oculus Browser
 (`web/player.html`, WebXR + WebCodecs). That path works but has a resolution
 ceiling the browser itself imposes (see below) - if/when that gets replaced
-with a native OpenXR app on the headset, these are the specific things this
-project already paid to learn the hard way. Skipping any of them means
-re-discovering the same bug from scratch.
+with a native app on the headset, these are the specific things this project
+already paid to learn the hard way. Skipping any of them means re-discovering
+the same bug from scratch.
+
+## Start here: Meta Spatial SDK's built-in 180 stereo media panel, not raw OpenXR
+
+Researched 2026-08-19, before writing any native code: **don't start from bare
+OpenXR + a hand-rolled dome mesh.** Meta's own **Spatial SDK** (Kotlin, the
+first-party framework for building Horizon OS apps) has a panel type built
+for exactly this:
+
+- `Equirect180ShapeOptions` + `MediaPanelSettings` (`stereoMode =
+  StereoMode.LeftRight` or `UpDown`) is a **built-in 180-degree stereo video
+  panel**, not something to build by hand.
+- `VideoSurfacePanelRegistration` connects an **ExoPlayer** instance to that
+  panel through a `Surface`. Meta's own docs recommend it "for maximum
+  performance... 360 content, and performance-critical scenarios" and
+  describe it as rendering "directly to the panel surface" - strongly
+  suggesting the panel is composited natively (like a 2D quad layer) rather
+  than sampled in an app-owned GL context. If that holds up under testing, it
+  sidesteps the entire precision/mipmap bug class below, the same reason
+  system-composited 2D panels always look sharper than a hand-rendered scene.
+- ExoPlayer already speaks LL-HLS and does hardware decode via MediaCodec
+  internally - our existing MediaMTX LL-HLS output may need zero PC-side
+  changes to feed it.
+- A concrete starting point exists: **`PremiumMediaSample`** in
+  [meta-quest/Meta-Spatial-SDK-Samples](https://github.com/meta-quest/Meta-Spatial-SDK-Samples)
+  plays 180-degree video over a stream. Get that running and pointed at our
+  own LL-HLS URL before writing any custom rendering code - it may cover most
+  of the work with none of the bugs the WebXR path hit.
+
+**Unresolved, needs on-device testing, not documentation**:
+- Whether the panel's internal buffering adds latency beyond the ~1s our
+  current LL-HLS pipeline already has - undocumented, and low latency matters
+  for spectating a live player.
+- Whether overlays (stats HUD, feather edge softening, headlock) are still
+  achievable alongside a system-composited panel, or need a separate
+  transparent quad panel layered into the scene instead.
+- Spatial SDK is Kotlin and almost certainly expects a standard Gradle/Android
+  Studio project - a real departure from this project's current no-Gradle raw
+  toolchain (`aapt2`/`d8`/`apksigner` in `quest-app/build-apk.ps1`), worth
+  deciding on deliberately before starting, not discovering mid-build.
+
+Everything below was written assuming a hand-rolled OpenXR + GL renderer (the
+fallback if the Spatial SDK panel route doesn't pan out, e.g. if its latency
+turns out too high for live spectating). Keep it - if the panel route hits a
+wall, this is the fallback plan and its lessons still apply.
 
 ## Why go native at all: the browser's WebXR resolution ceiling
 
