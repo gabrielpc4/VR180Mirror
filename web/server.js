@@ -197,7 +197,8 @@ function handler(req, res) {
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       res.end(JSON.stringify({ app: "vr180mirror", lanIp, stream: STREAM_PATH,
         httpsPort: HTTPS_PORT, httpPort: HTTP_PORT,
-        hspan: spans.hspan, vspan: spans.vspan, mirrorLive: spans.live === 1, ...extra }));
+        hspan: spans.hspan, vspan: spans.vspan, mirrorLive: spans.live === 1,
+        srcFps: spans.srcfps, ...extra }));
     };
     const req2 = http.get("http://127.0.0.1:9998/v3/paths/list", { timeout: 1500 }, (r2) => {
       let body = "";

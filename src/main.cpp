@@ -42,6 +42,8 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <atomic>
+#include <thread>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -80,6 +82,8 @@ static void logf(const char* fmt, ...);
 // viewer toggles options (e.g. "full picture" = feather 0). Polled ~1x/s.
 // ----------------------------------------------------------------------------
 static FILETIME g_rtWriteTime = {};
+static std::atomic<long long> g_presentCount{0};   // total presents, for rate reporting
+static std::atomic<int> g_presentFps{0};
 static void pollRuntimeFile() {
     static char path[MAX_PATH] = {};
     if (!path[0]) {
@@ -299,10 +303,11 @@ static void writeStatusFile() {
     }
     FILE* f = nullptr;
     if (fopen_s(&f, path, "wb") == 0 && f) {
-        fprintf(f, "{\"hspan\":%.1f,\"vspan\":%.1f,\"live\":%d}",
+        fprintf(f, "{\"hspan\":%.1f,\"vspan\":%.1f,\"live\":%d,\"srcfps\":%d}",
             vrs.hSpanRad * 180.0f / 3.14159265f,
             vrs.vSpanRad * 180.0f / 3.14159265f,
-            vrs.haveMirror ? 1 : 0);
+            vrs.haveMirror ? 1 : 0,
+            g_presentFps.load(std::memory_order_relaxed));
         fclose(f);
     }
 }
@@ -329,7 +334,7 @@ static void computeSpans() {
         logf("canvas span: %.1f x %.1f deg%s", h * 180.0f / PI_, v * 180.0f / PI_,
             (g_cfg.fitFov && vrs.connected) ? " (FOV-fit)" : " (full 180)");
     }
-    writeStatusFile();
+    // the status file is written by the I/O thread, never from the render loop
 }
 
 static void vrReleaseMirror() {
@@ -393,7 +398,6 @@ static bool vrAcquireMirror() {
         logf("Mirror acquired: %ux%u fmt=%d srgb=%d", td.Width, td.Height, (int)td.Format, (int)vrs.mirrorSrgb);
     }
     vrs.haveMirror = true;
-    writeStatusFile();
     return true;
 }
 
@@ -647,7 +651,12 @@ int main(int argc, char** argv) {
     }
     g_cfg.width  = std::max(640,  g_cfg.width  & ~1);
     g_cfg.height = std::max(320,  g_cfg.height & ~1);
-    g_cfg.fps    = std::clamp(g_cfg.fps, 10, 144);
+    // Present faster than the capture samples: OBS grabs presented frames on
+    // its own 72Hz clock, so if we also present at ~72 the two clocks beat and
+    // OBS captures the same frame twice about once per second (measured with
+    // ffmpeg framemd5: 7 duplicate frames per 432). Presenting at 2x means a
+    // fresh frame is always waiting, which removes the duplicates.
+    g_cfg.fps    = std::clamp(g_cfg.fps, 10, 300);
 
     setDpiAware();
     setGpuPriority();
@@ -697,7 +706,7 @@ int main(int argc, char** argv) {
     sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.BufferCount = 2;
+    sd.BufferCount = 3;   // 3 buffers: never let a flip stall the render loop
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sd.Scaling = DXGI_SCALING_STRETCH;   // backbuffer stays full-res; DWM scales to window
     if (FAILED(factory->CreateSwapChainForHwnd(g.dev.Get(), hwnd, &sd, nullptr, nullptr, &g.swap))) {
@@ -744,7 +753,18 @@ int main(int argc, char** argv) {
     }
 
     logf(vrs.connected ? "Ready." : "Waiting for SteamVR... (start SteamVR with the player headset; this app auto-connects)");
-    if (g_cfg.testGrid) logf("TEST GRID mode — rendering calibration pattern");
+    if (g_cfg.testGrid) logf("TEST GRID mode - rendering calibration pattern");
+
+    // File I/O off the render thread: a stat/read/write on the render loop is a
+    // stall, and a stalled render loop means a duplicated frame downstream.
+    std::atomic<bool> ioRun{true};
+    std::thread ioThread([&ioRun]() {
+        while (ioRun.load(std::memory_order_relaxed)) {
+            pollRuntimeFile();
+            writeStatusFile();
+            Sleep(500);
+        }
+    });
 
     // --- main loop ---
     LARGE_INTEGER qpf, qpc0, qpc;
@@ -762,9 +782,6 @@ int main(int argc, char** argv) {
         }
         if (g_quit) break;
 
-        static int rtCounter = 0;
-        if (++rtCounter >= g_cfg.fps) { rtCounter = 0; pollRuntimeFile(); }
-
         vrPump();
 
         bool live = vrs.haveMirror && !g_cfg.testGrid;
@@ -781,6 +798,19 @@ int main(int argc, char** argv) {
         renderFrame(now);
         g.swap->Present(0, 0);
 
+        // present-rate report: a source that misses its target duplicates
+        // frames downstream, so make the actual rate visible
+        g_presentCount.fetch_add(1, std::memory_order_relaxed);
+        static int fpsFrames = 0;
+        static double fpsSince = 0.0;
+        if (++fpsFrames >= 300) {
+            const double rate = fpsFrames / (now - fpsSince);
+            g_presentFps.store((int)(rate + 0.5), std::memory_order_relaxed);
+            logf("present rate: %.1f fps (target %d)", rate, g_cfg.fps);
+            fpsFrames = 0;
+            fpsSince = now;
+        }
+
         // pacing
         nextT += period;
         QueryPerformanceCounter(&qpc);
@@ -796,6 +826,8 @@ int main(int argc, char** argv) {
         }
     }
 
+    ioRun.store(false);
+    if (ioThread.joinable()) ioThread.join();
     vrDisconnect("exit");
     timeEndPeriod(1);
     logf("bye");

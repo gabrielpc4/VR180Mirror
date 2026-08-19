@@ -168,7 +168,9 @@ if (Get-OurProcess "node.exe" "VR180Mirror\web\server.js") {
 if (Get-OurProcess "VR180Mirror.exe" "VR180Mirror") {
     Write-Host "VR180Mirror already running"
 } else {
-    $mirrorArgs = @("--size","${canvasW}x${canvasH}","--fps","$fps","--preview","1280")
+    # render at 2x the stream rate: OBS samples presented frames on its own clock,
+    # so a fresh frame must always be waiting or it captures duplicates
+    $mirrorArgs = @("--size","${canvasW}x${canvasH}","--fps","$($fps * 2)","--preview","1280")
     if ($VR180) { $mirrorArgs += "--vr180" }
     if ($TestGrid) { $mirrorArgs += "--test-grid" }
     Start-Process -FilePath "$root\bin\VR180Mirror.exe" -ArgumentList $mirrorArgs `

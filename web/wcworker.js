@@ -12,8 +12,32 @@
 importScripts("mp4box.all.min.js");
 
 let mp4 = null, decoder = null, cfg = null, offset = 0;
-let pending = [], credits = 0, lastDepthPost = 0;
-const PENDING_MAX = 260;   // undecoded (compressed) chunks
+let pending = [], outstanding = 0, lastDepthPost = 0;
+let credits = 0, bonus = 0;
+
+// Backlog control. Segments arrive as 1-second bursts, so the undecoded backlog
+// naturally sawtooths between ~0 and ~72 chunks; these thresholds sit above
+// that. If the display consumes slightly slower than the source produces (e.g.
+// the XR loop misses a frame now and then), the drift must be shed somewhere:
+//   - small drift  -> decode a little faster than demand and let the page
+//                     discard single frames (a 14ms step, imperceptible)
+//   - large backlog -> the fetcher jumps to the live edge; segment boundaries
+//                     are keyframes, so that is a clean cut, not a corruption
+// Shedding it only at the large threshold is what produced the visible
+// "latency climbs to 3s, then jumps back" sawtooth.
+//
+// Decoding is DEMAND-PACED: one decode per frame the page consumed or shed
+// (a credit). Catch-up adds a small fraction on top - decoding flat out
+// instead overflowed the page's 6-frame queue and then starved it (measured:
+// dec 114/s, discarded 74/s, held 44/s, 737ms gaps).
+// Decoding is purely demand-paced: exactly one decode per credit, and the page
+// sends one credit per frame it consumed or shed. Catch-up is therefore driven
+// by the page shedding frames while the backlog is high (it reports the backlog
+// in the HUD as q<queue>+<pending>), which keeps the two mechanisms from
+// fighting each other.
+const INFLIGHT_CAP = 5;      // decoded frames posted but not yet consumed
+const SKIP_BACKLOG = 200;    // chunks (~2.8s): fetcher rejoins at the live edge
+const PENDING_MAX = 260;     // chunks (~3.6s): hard safety, GOP skip
 
 const log = (m) => postMessage({ type: "log", msg: String(m) });
 
@@ -40,7 +64,7 @@ function ensureFile() {
     } catch (e) { log("desc: " + e); }
 
     decoder = new VideoDecoder({
-      output: (frame) => postMessage({ type: "frame", frame }, [frame]),
+      output: (frame) => { outstanding++; postMessage({ type: "frame", frame }, [frame]); },
       error: (e) => log("decoder: " + e.message),
     });
     cfg = { codec: tr.codec, optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" };
@@ -84,14 +108,15 @@ function drain() {
     }
   }
 
-  while (credits > 0 && pending.length && decoder.decodeQueueSize < 4) {
+  while (credits > 0 && pending.length && decoder.decodeQueueSize < 4 &&
+         outstanding + decoder.decodeQueueSize < INFLIGHT_CAP) {
     const p = pending.shift();
     credits--;
     try { decoder.decode(p.chunk); } catch (e) { log("decode: " + e.message); }
   }
 
   const now = Date.now();
-  if (now - lastDepthPost > 250) {
+  if (now - lastDepthPost > 120) {
     lastDepthPost = now;
     postMessage({ type: "depth", pending: pending.length, dq: decoder.decodeQueueSize });
   }
@@ -165,6 +190,14 @@ async function startDirect(masterUrl) {
         // start one segment back from the live edge: enough to prime, minimal latency
         nextSeq = pl.mediaSeq + Math.max(0, pl.segs.length - 2);
       }
+      // Backpressure: with a big backlog, rejoin at the live edge instead of
+      // downloading more. Each segment starts with a keyframe, so this is a
+      // clean cut. Small drift is handled smoothly in drain() instead.
+      const latestSeq = pl.mediaSeq + Math.max(0, pl.segs.length - 1);
+      if (pending.length > SKIP_BACKLOG && latestSeq > nextSeq) {
+        log("resync: skipped " + (latestSeq - nextSeq) + " segment(s), backlog " + pending.length);
+        nextSeq = latestSeq;
+      }
       let got = 0;
       for (let k = 0; k < pl.segs.length; k++) {
         const seq = pl.mediaSeq + k;
@@ -198,12 +231,16 @@ onmessage = (e) => {
     try { mp4.appendBuffer(buf); } catch (err) { log("append: " + err); }
     drain();
   } else if (m.type === "credit") {
-    credits += m.n || 1;
-    if (credits > 16) credits = 16;    // never let credit debt build up
+    // the page consumed or shed a frame: it is no longer outstanding, and we
+    // may decode one more (plus a fraction extra while burning off a backlog)
+    const n = m.n || 1;
+    outstanding = Math.max(0, outstanding - n);
+    credits = Math.min(credits + n, INFLIGHT_CAP + 2);
     drain();
   } else if (m.type === "reset") {
     if (fetcher) { fetcher.running = false; fetcher = null; }
     try { if (decoder && decoder.state !== "closed") decoder.close(); } catch (err) {}
-    mp4 = null; decoder = null; cfg = null; offset = 0; pending = []; credits = 0;
+    mp4 = null; decoder = null; cfg = null; offset = 0; pending = [];
+    outstanding = 0; credits = 0; bonus = 0;
   }
 };

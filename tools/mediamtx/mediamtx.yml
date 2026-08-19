@@ -16,7 +16,10 @@ udpReadBufferSize: 4194304
 # local-only control API - used by Start-Spectator.ps1 to health-check ingest
 api: true
 apiAddress: 127.0.0.1:9998
-rtsp: false
+# RTSP on a private port: frame-exact local pulls for diagnostics
+rtsp: true
+rtspAddress: 127.0.0.1:9554
+rtspTransports: [tcp]
 rtmp: false
 # SRT ingest from OBS: reliable on loopback (recovers lost packets), unlike
 # WHIP's plain UDP which dropped RTP under 150 Mbps keyframe bursts

@@ -124,9 +124,10 @@ const wc = {
   // Depths are deliberately tiny: one decoded 4096x2048 frame is ~12.6MB, so a
   // deep queue trips Android's low-memory killer (observed: the tab reloading
   // itself mid-session) and causes GC hitches.
-  DEPTH_TARGET: 3,     // frames to keep in hand
-  DEPTH_PRIME: 2,      // wait for this many before the first frame is shown
-  DEPTH_SLACK: 2,      // beyond target+slack, consume 2 frames in one XR frame
+  DEPTH_PRIME: 2,       // frames to have in hand before the first is shown
+  BACKLOG_DRIFT: 110,   // undecoded chunks (~1.5s) that mean we are behind
+  CATCHUP_EVERY: 8,     // while behind, shed 1 frame per this many shown (~9/s)
+  _catchup: 0,
   reset() {
     if (this.worker) {
       try { this.worker.postMessage({ type: "reset" }); this.worker.terminate(); } catch (e) {}
@@ -145,10 +146,15 @@ const wc = {
       if (m.type === "frame") {
         this._outCount++;
         this.queue.push(m.frame);
-        while (this.queue.length > 8) {
+        // Even rate matching: when the worker decodes ahead of us (it does that
+        // deliberately while a backlog exists), shed the oldest frame here -
+        // one frame at a time, which is invisible, instead of letting the
+        // backlog grow into a visible jump.
+        while (this.queue.length > 6) {
           const f = this.queue.shift();
           this._discCount++;
           try { f.close(); } catch (err) {}
+          if (this.worker) this.worker.postMessage({ type: "credit", n: 1 });
         }
         if (!connected) {                    // first frames: we are live
           connected = true;
@@ -169,7 +175,7 @@ const wc = {
         window.__wcErr = m.msg;
       }
     };
-    this.worker.postMessage({ type: "credit", n: this.DEPTH_TARGET + this.DEPTH_SLACK });
+    this.worker.postMessage({ type: "credit", n: 5 });   // prime the pipeline
   },
   feed(chunk) {                       // Uint8Array fMP4 bytes from hls.js
     if (!window.VideoDecoder) return;
@@ -193,11 +199,20 @@ const wc = {
       if (this.queue.length < this.DEPTH_PRIME) return null;
       this.primed = true;
     }
-    if (this.queue.length > this.DEPTH_TARGET + this.DEPTH_SLACK) {
-      const stale = this.queue.shift();
-      this._discCount++;
-      try { stale.close(); } catch (e) {}
-      if (this.worker) this.worker.postMessage({ type: "credit", n: 1 });
+    // Gentle catch-up: while an undecoded backlog persists (we are consuming
+    // slower than the source produces), shed one extra frame every few frames.
+    // That is a 14ms step, invisible, and it drains the backlog steadily
+    // instead of letting it grow until something skips a whole second.
+    if (this.pendingDepth > this.BACKLOG_DRIFT && this.queue.length > 1) {
+      if (++this._catchup >= this.CATCHUP_EVERY) {
+        this._catchup = 0;
+        const stale = this.queue.shift();
+        this._discCount++;
+        try { stale.close(); } catch (e) {}
+        if (this.worker) this.worker.postMessage({ type: "credit", n: 1 });
+      }
+    } else {
+      this._catchup = 0;
     }
     const f = this.queue.shift();
     this._dispCount++;
@@ -409,15 +424,14 @@ async function fetchSpans() {
 
 // 2D preview: outside an XR session, consume frames here so the pipeline keeps
 // flowing and the flat preview still shows the stream (the element has no video
-// track in direct mode). Throttled to ~36fps - it is only a preview.
+// track in direct mode). Consumes at the source rate - throttling it to half
+// rate made the backlog (and the latency) climb until a skip yanked it back.
 {
   const pv = $("preview");
   const pctx = pv.getContext("2d");
-  let toggle = 0;
   const loop = () => {
     requestAnimationFrame(loop);
     if (xrSession || !wc.active) return;
-    if ((toggle ^= 1)) return;
     const f = wc.pick();
     if (f) {
       try { pctx.drawImage(f, 0, 0, pv.width, pv.height); } catch (e) {}
@@ -483,9 +497,19 @@ async function runGlDome() {
   let spans = await fetchSpans();
 
   const canvas = document.createElement("canvas");
-  const gl = canvas.getContext("webgl2", { xrCompatible: true });
+  const gl = canvas.getContext("webgl2", {
+    xrCompatible: true, antialias: false, depth: false, alpha: false,
+    powerPreference: "high-performance", desynchronized: true,
+  });
   await gl.makeXRCompatible();
-  xrSession.updateRenderState({ baseLayer: new XRWebGLLayer(xrSession, gl) });
+  // A video dome needs no MSAA and no depth buffer; both cost fill-rate we
+  // would otherwise pay every frame. Missing the frame deadline makes the
+  // headset compositor re-project a stale frame, which reads as micro-stutter
+  // (the HUD's "stale" counter was showing 1-6 per second).
+  const glLayerInit = { antialias: false, depth: false, stencil: false, alpha: false };
+  const baseLayer = new XRWebGLLayer(xrSession, gl, glLayerInit);
+  try { baseLayer.fixedFoveation = 1; } catch (e) {}   // cheaper periphery on Quest
+  xrSession.updateRenderState({ baseLayer });
 
   const compile = (type, src) => {
     const s = gl.createShader(type);
@@ -573,6 +597,17 @@ async function runGlDome() {
     return t;
   };
   const videoTex = mkTex(), hudTex = mkTex();
+  // Pre-allocate the video texture so each frame is a texSubImage2D update
+  // instead of a full re-specification (which reallocates GPU storage).
+  let texW = 0, texH = 0;
+  function uploadFrame(src, w, h) {
+    gl.bindTexture(gl.TEXTURE_2D, videoTex);
+    if (w !== texW || h !== texH) {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      texW = w; texH = h;
+    }
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, src);
+  }
 
   // rolling metrics + HUD repaint
   let rafCount = 0, lastQ = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
@@ -644,13 +679,11 @@ async function runGlDome() {
       wc.pump();
       const f = wc.pick();
       if (f) {
-        gl.bindTexture(gl.TEXTURE_2D, videoTex);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, f);
+        uploadFrame(f, f.displayWidth || wc.w, f.displayHeight || wc.h);
         try { f.close(); } catch (e) {}   // release immediately: 12.6MB per frame
       }
-    } else if (video.readyState >= 2) {
-      gl.bindTexture(gl.TEXTURE_2D, videoTex);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+    } else if (video.readyState >= 2 && video.videoWidth) {
+      uploadFrame(video, video.videoWidth, video.videoHeight);
     }
 
     const glLayer = xrSession.renderState.baseLayer;
