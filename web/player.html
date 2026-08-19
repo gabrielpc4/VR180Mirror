@@ -20,6 +20,9 @@
   #video-wrap { width: min(96vw, 1100px); aspect-ratio: 2 / 1; background: #000;
     border: 1px solid #26292e; border-radius: 10px; overflow: hidden; position: relative; }
   video { width: 100%; height: 100%; object-fit: contain; }
+  /* direct-decode mode: the element carries audio only, so the preview is
+     drawn from the decoded frames */
+  #preview { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
   #overlay { position: absolute; inset: 0; display: flex; flex-direction: column;
     align-items: center; justify-content: center; gap: 10px;
     background: #000a; backdrop-filter: blur(2px); }
@@ -45,6 +48,7 @@
 
   <div id="video-wrap">
     <video id="video" playsinline muted></video>
+    <canvas id="preview" width="1024" height="512"></canvas>
     <div id="overlay">
       <button id="connect" class="big">▶ Connect to stream</button>
       <div id="status">Not connected</div>
@@ -113,6 +117,7 @@ video.addEventListener("playing", () => {
 const wc = {
   active: false, worker: null, queue: [], primed: false, pendingDepth: 0,
   outPerSec: 0, _outCount: 0, dispPerSec: 0, _dispCount: 0,
+  discPerSec: 0, _discCount: 0, heldPerSec: 0, _heldCount: 0, direct: false,
   // Pacing is a plain jitter buffer, NOT a clock comparison: the source is
   // 72fps and the XR loop is ~72fps, so display one frame per XR frame and let
   // the worker decode exactly as fast as we consume (credit per frame).
@@ -129,6 +134,7 @@ const wc = {
     }
     for (const f of this.queue) { try { f.close(); } catch (e) {} }
     this.queue = []; this.active = false; this.primed = false; this.pendingDepth = 0;
+    this.direct = false;
   },
   ensureWorker() {
     if (this.worker) return;
@@ -139,11 +145,26 @@ const wc = {
       if (m.type === "frame") {
         this._outCount++;
         this.queue.push(m.frame);
-        while (this.queue.length > 8) { const f = this.queue.shift(); try { f.close(); } catch (err) {} }
+        while (this.queue.length > 8) {
+          const f = this.queue.shift();
+          this._discCount++;
+          try { f.close(); } catch (err) {}
+        }
+        if (!connected) {                    // first frames: we are live
+          connected = true;
+          $("dot").classList.add("live");
+          $("overlay").classList.add("hidden");
+          updateVRButton();
+          setStatus("Live - max resolution (direct decode)");
+        }
       } else if (m.type === "ready") {
         this.active = true;
+        this.w = m.w; this.h = m.h;
       } else if (m.type === "depth") {
         this.pendingDepth = m.pending;
+      } else if (m.type === "direct-failed") {
+        window.__wcErr = "direct: " + m.msg;
+        if (this.direct) { this.direct = false; hlsMseConnect().catch(() => {}); }
       } else if (m.type === "log") {
         window.__wcErr = m.msg;
       }
@@ -167,13 +188,14 @@ const wc = {
   // 14ms skip, imperceptible) and when it runs dry we simply hold the last
   // frame. Corrections stay small and constant instead of rare and visible.
   pick() {
-    if (!this.queue.length) return null;
+    if (!this.queue.length) { if (this.primed) this._heldCount++; return null; }
     if (!this.primed) {
       if (this.queue.length < this.DEPTH_PRIME) return null;
       this.primed = true;
     }
     if (this.queue.length > this.DEPTH_TARGET + this.DEPTH_SLACK) {
       const stale = this.queue.shift();
+      this._discCount++;
       try { stale.close(); } catch (e) {}
       if (this.worker) this.worker.postMessage({ type: "credit", n: 1 });
     }
@@ -186,13 +208,48 @@ const wc = {
 setInterval(() => {
   wc.outPerSec = wc._outCount * 2; wc._outCount = 0;
   wc.dispPerSec = wc._dispCount * 2; wc._dispCount = 0;
+  wc.discPerSec = wc._discCount * 2; wc._discCount = 0;
+  wc.heldPerSec = wc._heldCount * 2; wc._heldCount = 0;
   if (wc.active) wc.pump();   // backup pump outside XR
 }, 500);
 
 // ------------------------------------------------------------- buffered (MSE)
 // hls.js -> MSE -> the browser's hardware video pipeline (the path Meta
 // documents as 8K-capable for HEVC/AV1) reading MediaMTX LL-HLS via our proxy.
+// Preferred buffered path: the worker fetches + decodes the video rendition
+// directly (no MSE, no second decode of the same stream), and the media element
+// carries the audio rendition only.
 async function bufferedConnect() {
+  const master = new URL("/hls/index.m3u8", location.href).href;
+  if (window.VideoDecoder && window.Worker) {
+    wc.reset();
+    wc.ensureWorker();
+    wc.direct = true;
+    wc.worker.postMessage({ type: "direct", url: master });
+    setStatus("Starting max-resolution video (direct decode)…");
+    audioOnlyConnect(master).catch(() => {});   // optional, never fatal
+    return;
+  }
+  return hlsMseConnect();
+}
+
+// Audio rendition only: MediaMTX publishes audio as a separate HLS rendition,
+// so we can keep sound without the element touching the 4K video track.
+async function audioOnlyConnect(masterUrl) {
+  if (!window.Hls || !Hls.isSupported()) return;
+  const txt = await (await fetch(masterUrl, { cache: "no-store" })).text();
+  const m = txt.match(/#EXT-X-MEDIA:TYPE=AUDIO[^\n]*URI="([^"]+)"/);
+  if (!m) return;
+  const audioUrl = new URL(m[1], masterUrl).href;
+  hls = new Hls({ lowLatencyMode: true, backBufferLength: 4, maxBufferLength: 6 });
+  hls.loadSource(audioUrl);
+  hls.attachMedia(video);
+  video.muted = $("muted").checked;
+  video.play().catch(() => {});
+}
+
+// Legacy fallback: full MSE playback (also feeds the worker from hls.js chunks).
+async function hlsMseConnect() {
   if (!window.Hls || !Hls.isSupported()) {
     throw new Error("MSE not supported in this browser");
   }
@@ -212,7 +269,6 @@ async function bufferedConnect() {
     }
   });
   // sideband: raw fMP4 video chunks -> WebCodecs (see wc above)
-  wc.reset();
   hls.on(Hls.Events.BUFFER_APPENDING, (e, data) => {
     if (data && (data.type === "video" || data.type === "audiovideo") && data.data) {
       wc.feed(data.data);
@@ -349,6 +405,26 @@ async function fetchSpans() {
     }
   } catch (e) {}
   return { h: Math.PI, v: Math.PI };
+}
+
+// 2D preview: outside an XR session, consume frames here so the pipeline keeps
+// flowing and the flat preview still shows the stream (the element has no video
+// track in direct mode). Throttled to ~36fps - it is only a preview.
+{
+  const pv = $("preview");
+  const pctx = pv.getContext("2d");
+  let toggle = 0;
+  const loop = () => {
+    requestAnimationFrame(loop);
+    if (xrSession || !wc.active) return;
+    if ((toggle ^= 1)) return;
+    const f = wc.pick();
+    if (f) {
+      try { pctx.drawImage(f, 0, 0, pv.width, pv.height); } catch (e) {}
+      try { f.close(); } catch (e) {}
+    }
+  };
+  requestAnimationFrame(loop);
 }
 
 // live metrics shared with the HUD
@@ -516,13 +592,18 @@ async function runGlDome() {
     hctx.fillRect(0, 0, hudW, hudH);
     hctx.fillStyle = "#3ec3dc";
     hctx.font = "bold 42px monospace";
-    const vsrc = wc.active
-      ? `shown ${wc.dispPerSec} dec ${wc.outPerSec} q${wc.queue.length}+${wc.pendingDepth}`
-      : `video ${live.vidFps}fps`;
-    hctx.fillText(`XR ${live.xrFps}  ${vsrc}  drop ${live.dropPs}/s  buf ${live.buf.toFixed(1)}s`, 16, 60);
+    // honest pipeline telemetry: what we showed, decoded, threw away for rate
+    // matching (disc), and XR frames with no new frame (held)
+    const line1 = wc.active
+      ? `XR ${live.xrFps} shown ${wc.dispPerSec} dec ${wc.outPerSec} `
+        + `disc ${wc.discPerSec} held ${wc.heldPerSec} q${wc.queue.length}+${wc.pendingDepth}`
+      : `XR ${live.xrFps} video ${live.vidFps} drop ${live.dropPs}/s buf ${live.buf.toFixed(1)}s`;
+    hctx.fillText(line1, 16, 60);
     hctx.fillStyle = "#e2eaf1";
     hctx.fillText(`HMD ${d.fps ?? "-"}/${d.maxFps ?? "-"}fps stale ${d.stale ?? "-"}  GPU ${d.gpuBusy ?? "-"}% ${d.gpuMHz ?? "-"}MHz`, 16, 122);
-    hctx.fillText(`CPU L${d.cpuLvl ?? "-"} ${d.cpuMHz ?? "-"}MHz  ${d.temp ?? "-"}C  ${video.videoWidth}x${video.videoHeight}`, 16, 184);
+    const dim = wc.active ? `${wc.w || "?"}x${wc.h || "?"}` : `${video.videoWidth}x${video.videoHeight}`;
+    const lat = wc.active ? `  lat ${((wc.queue.length + wc.pendingDepth) / 72).toFixed(1)}s` : "";
+    hctx.fillText(`CPU L${d.cpuLvl ?? "-"} ${d.cpuMHz ?? "-"}MHz  ${d.temp ?? "-"}C  ${dim}${lat}`, 16, 184);
     gl.bindTexture(gl.TEXTURE_2D, hudTex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, hudCanvas);
   }, 500);
@@ -624,6 +705,10 @@ setInterval(async () => {
       }
     });
     $("stats").textContent = `WebRTC · ${w}x${h} @ ${fps}fps · ${kbps} kbit/s`;
+  } else if (wc.active) {
+    $("stats").textContent = `Direct decode · ${wc.w || "?"}x${wc.h || "?"} · shown ${wc.dispPerSec}/s`
+      + ` · dec ${wc.outPerSec}/s · discarded ${wc.discPerSec}/s · held ${wc.heldPerSec}/s`
+      + ` · latency ${((wc.queue.length + wc.pendingDepth) / 72).toFixed(1)}s`;
   } else if (hls && video.videoWidth) {
     const q = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
     $("stats").textContent = `Buffered · ${video.videoWidth}x${video.videoHeight}`
