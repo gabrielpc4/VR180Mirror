@@ -14,11 +14,12 @@
 param(
     [switch]$TestGrid,
     [switch]$NoOBS,
-    # av1 (default): 5120x2560@72, ~25 px/deg - needs the spectator on a Quest 3
-    # (hardware AV1 decode). h264: 3840x1920@72 fallback, works everywhere
-    # (level 5.2 ceiling) and required for the DeoVR/HLS route.
+    # h264 (default): 3840x1920@72 - hardware-decoded reliably by the Quest
+    # browser's WebRTC path (its AV1 WebRTC decode proved to be software-only:
+    # full bitrate arrived but rendered <1fps at 6144x3072). av1: 6144x3072@72,
+    # experimental - only if the viewer page's decoder badge says hardware.
     [ValidateSet("av1", "h264")]
-    [string]$Codec = "av1",
+    [string]$Codec = "h264",
     # target bitrate in kbps (also the floor when -MaxBitrate is set).
     # 0 = codec default (av1: 150000, h264: 80000)
     [int]$Bitrate = 0,
@@ -35,7 +36,7 @@ $fps = 72
 # av1: 6144x3072@72 = 1.36 Gpx/s, ~68% of the Quest 3 decoder's rated 8K60 budget
 # h264: Meta browser caps H.264 at 4K; 3840x1920@72 is also the level 5.2 ceiling
 if ($Codec -eq "av1") { $canvasW = 6144; $canvasH = 3072; $encoderId = "obs_nvenc_av1_tex"; $defBitrate = 150000 }
-else                  { $canvasW = 3840; $canvasH = 1920; $encoderId = "obs_nvenc_h264_tex"; $defBitrate = 80000 }
+else                  { $canvasW = 3840; $canvasH = 1920; $encoderId = "obs_nvenc_h264_tex"; $defBitrate = 100000 }
 if ($Bitrate -le 0) { $Bitrate = $defBitrate }
 
 # ---- first-run provisioning ----------------------------------------------------
