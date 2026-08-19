@@ -69,6 +69,7 @@
   <div id="cap" style="color:#6f757d;font-size:.8rem"></div>
 
 <script src="hls.min.js"></script>
+<script src="mp4box.all.min.js"></script>
 <script>
 "use strict";
 
@@ -90,6 +91,7 @@ function teardownTransports() {
   if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
   if (pc) { try { pc.close(); } catch (e) {} pc = null; }
   if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
+  wc.reset();
   video.srcObject = null;
   video.removeAttribute("src");
 }
@@ -101,6 +103,100 @@ video.addEventListener("playing", () => {
   $("overlay").classList.add("hidden");
   updateVRButton();
 });
+
+// ------------------------------------------------- WebCodecs sideband decoder
+// The Quest browser's video-to-GL acquisition is broken for MSE/WebRTC-backed
+// elements (measured: 0.7 distinct frames/s reach GL while the element
+// presents 72). So in VR we decode the video track OURSELVES: hls.js hands us
+// the raw fMP4 chunks (BUFFER_APPENDING) -> mp4box demuxes -> VideoDecoder
+// (hardware) -> GPU-backed VideoFrames -> the dome texture. The muted-audio
+// clock of the element still drives A/V sync.
+const wc = {
+  active: false, decoder: null, mp4: null, offset: 0,
+  queue: [], displayed: null, outPerSec: 0, _outCount: 0,
+  reset() {
+    try { if (this.decoder && this.decoder.state !== "closed") this.decoder.close(); } catch (e) {}
+    for (const f of this.queue) { try { f.close(); } catch (e) {} }
+    if (this.displayed) { try { this.displayed.close(); } catch (e) {} }
+    this.active = false; this.decoder = null; this.mp4 = null;
+    this.offset = 0; this.queue = []; this.displayed = null;
+  },
+  feed(chunk) {                       // Uint8Array fMP4 bytes from hls.js
+    if (!window.VideoDecoder || !window.MP4Box) return;
+    if (!this.mp4) {
+      this.mp4 = MP4Box.createFile();
+      this.mp4.onError = (e) => { window.__wcErr = "mp4box: " + e; };
+      this.mp4.onReady = (info) => {
+        const tr = info.videoTracks && info.videoTracks[0];
+        if (!tr) return;
+        let desc = null;
+        try {
+          const trak = this.mp4.getTrackById(tr.id);
+          for (const entry of trak.mdia.minf.stbl.stsd.entries) {
+            const box = entry.avcC || entry.hvcC || entry.av1C || entry.vpcC;
+            if (box) {
+              const ds = new DataStream(undefined, 0, DataStream.BIG_ENDIAN);
+              box.write(ds);
+              desc = new Uint8Array(ds.buffer, 8);
+              break;
+            }
+          }
+        } catch (e) { window.__wcErr = "desc: " + e; }
+        this.decoder = new VideoDecoder({
+          output: (frame) => {
+            this._outCount++;
+            this.queue.push(frame);
+            while (this.queue.length > 12) { const f = this.queue.shift(); try { f.close(); } catch (e) {} }
+          },
+          error: (e) => { window.__wcErr = "decoder: " + e.message; this.active = false; },
+        });
+        const cfg = { codec: tr.codec, optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" };
+        if (desc) cfg.description = desc;
+        try {
+          this.decoder.configure(cfg);
+          this.active = true;
+        } catch (e) { window.__wcErr = "configure: " + e.message; }
+        this.mp4.setExtractionOptions(tr.id, null, { nbSamples: 30 });
+        this.mp4.start();
+      };
+      this.mp4.onSamples = (id, user, samples) => {
+        if (!this.decoder || this.decoder.state !== "configured") return;
+        for (const s of samples) {
+          try {
+            this.decoder.decode(new EncodedVideoChunk({
+              type: s.is_sync ? "key" : "delta",
+              timestamp: Math.round(s.cts * 1e6 / s.timescale),
+              duration: Math.round(s.duration * 1e6 / s.timescale),
+              data: s.data,
+            }));
+          } catch (e) { window.__wcErr = "decode: " + e.message; }
+        }
+      };
+    }
+    const buf = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
+    buf.fileStart = this.offset;
+    this.offset += buf.byteLength;
+    try { this.mp4.appendBuffer(buf); } catch (e) { window.__wcErr = "append: " + e; }
+  },
+  // newest frame not ahead of the element clock (A/V sync); falls back to
+  // the newest available so startup shows video before the clock settles
+  pick(clockSec) {
+    if (!this.queue.length) return null;
+    let idx = -1;
+    for (let i = 0; i < this.queue.length; i++) {
+      if (this.queue[i].timestamp / 1e6 <= clockSec + 0.06) idx = i; else break;
+    }
+    if (idx < 0 && this.queue.length > 8) idx = 0;   // clock stalled? don't starve
+    if (idx < 0) return null;
+    for (let i = 0; i < idx; i++) { const f = this.queue[i]; try { f.close(); } catch (e) {} }
+    this.queue.splice(0, idx);
+    const f = this.queue.shift();
+    if (this.displayed) { try { this.displayed.close(); } catch (e) {} }
+    this.displayed = f;
+    return f;
+  },
+};
+setInterval(() => { wc.outPerSec = wc._outCount * 2; wc._outCount = 0; }, 500);
 
 // ------------------------------------------------------------- buffered (MSE)
 // hls.js -> MSE -> the browser's hardware video pipeline (the path Meta
@@ -122,6 +218,13 @@ async function bufferedConnect() {
       $("connect").textContent = "▶ Reconnect";
       $("connect").disabled = false;
       $("overlay").classList.remove("hidden");
+    }
+  });
+  // sideband: raw fMP4 video chunks -> WebCodecs (see wc above)
+  wc.reset();
+  hls.on(Hls.Events.BUFFER_APPENDING, (e, data) => {
+    if (data && (data.type === "video" || data.type === "audiovideo") && data.data) {
+      wc.feed(data.data);
     }
   });
   hls.loadSource(new URL("/hls/index.m3u8", location.href).href);
@@ -422,7 +525,8 @@ async function runGlDome() {
     hctx.fillRect(0, 0, hudW, hudH);
     hctx.fillStyle = "#3ec3dc";
     hctx.font = "bold 44px monospace";
-    hctx.fillText(`XR ${live.xrFps}fps  video ${live.vidFps}fps  drop ${live.dropPs}/s  buf ${live.buf.toFixed(1)}s`, 18, 62);
+    const vsrc = wc.active ? `dec ${wc.outPerSec}fps (WC)` : `video ${live.vidFps}fps`;
+    hctx.fillText(`XR ${live.xrFps}fps  ${vsrc}  drop ${live.dropPs}/s  buf ${live.buf.toFixed(1)}s`, 18, 62);
     hctx.fillStyle = "#e2eaf1";
     hctx.fillText(`HMD ${d.fps ?? "-"}/${d.maxFps ?? "-"}fps stale ${d.stale ?? "-"}  GPU ${d.gpuBusy ?? "-"}% ${d.gpuMHz ?? "-"}MHz`, 18, 118);
     hctx.fillText(`CPU L${d.cpuLvl ?? "-"} ${d.cpuMHz ?? "-"}MHz  ${d.temp ?? "-"}C  ${video.videoWidth}x${video.videoHeight}`, 18, 174);
@@ -460,10 +564,17 @@ async function runGlDome() {
     const pose = frame.getViewerPose(refSpace);
     if (!pose) return;
 
-    // one video upload shared by both eyes
-    if (video.readyState >= 2) {
+    // one video upload shared by both eyes: prefer the WebCodecs sideband
+    // (GPU VideoFrames), fall back to the element (broken-ish on Quest)
+    if (wc.active) {
+      const f = wc.pick(video.currentTime);
+      if (f) {
+        gl.bindTexture(gl.TEXTURE_2D, videoTex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, f);
+      }
+    } else if (video.readyState >= 2) {
       gl.bindTexture(gl.TEXTURE_2D, videoTex);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, video);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
     }
 
     const glLayer = xrSession.renderState.baseLayer;
