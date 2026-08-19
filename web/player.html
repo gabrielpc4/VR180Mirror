@@ -69,7 +69,6 @@
   <div id="cap" style="color:#6f757d;font-size:.8rem"></div>
 
 <script src="hls.min.js"></script>
-<script src="mp4box.all.min.js"></script>
 <script>
 "use strict";
 
@@ -112,160 +111,82 @@ video.addEventListener("playing", () => {
 // (hardware) -> GPU-backed VideoFrames -> the dome texture. The muted-audio
 // clock of the element still drives A/V sync.
 const wc = {
-  active: false, decoder: null, mp4: null, offset: 0, cfg: null,
-  queue: [], pending: [], displayed: null, outPerSec: 0, _outCount: 0,
-  lastAppendTs: null, clockOffset: null, offsets: [], playhead: null, _lastWall: null,
-  // hls.js re-bases live segments onto the element timeline, while mp4box
-  // reports the muxer's raw timestamps (observed ~2141s apart). The offset
-  // sample (newest appended ts vs buffered end) is noisy, so: median-filter
-  // the offset, and run a MONOTONIC playhead that advances at 1x wall time,
-  // only gently slewed (max 4%) toward the offset-corrected element clock.
-  // This keeps decode/display at a rock-steady 72 while staying A/V-locked.
-  estimateOffset() {
-    if (this.lastAppendTs == null || !video.buffered.length) return;
-    const est = this.lastAppendTs / 1e6 - video.buffered.end(video.buffered.length - 1);
-    this.offsets.push(est);
-    if (this.offsets.length > 9) this.offsets.shift();
-    const s = [...this.offsets].sort((a, b) => a - b);
-    this.clockOffset = s[Math.floor(s.length / 2)];
-  },
-  clock() {
-    const now = performance.now();
-    const target = this.clockOffset != null ? video.currentTime + this.clockOffset : null;
-    if (this.playhead == null) {
-      this.playhead = target != null ? target
-        : (this.pending.length ? this.pending[0].ts / 1e6 + 0.2 : null);
-      this._lastWall = now;
-      return this.playhead == null ? 0 : this.playhead;
-    }
-    const dt = Math.min(0.25, (now - this._lastWall) / 1000);
-    this._lastWall = now;
-    if (!video.paused) {
-      let rate = 1.0;
-      if (target != null) {
-        const err = target - this.playhead;
-        if (Math.abs(err) > 2.0) { this.playhead = target; return this.playhead; }  // seek/discontinuity
-        rate = 1.0 + Math.max(-0.04, Math.min(0.04, err * 0.1));
-      }
-      this.playhead += dt * rate;
-    }
-    return this.playhead;
-  },
+  active: false, worker: null, queue: [], primed: false, pendingDepth: 0,
+  outPerSec: 0, _outCount: 0, dispPerSec: 0, _dispCount: 0,
+  // Pacing is a plain jitter buffer, NOT a clock comparison: the source is
+  // 72fps and the XR loop is ~72fps, so display one frame per XR frame and let
+  // the worker decode exactly as fast as we consume (credit per frame).
+  // Depths are deliberately tiny: one decoded 4096x2048 frame is ~12.6MB, so a
+  // deep queue trips Android's low-memory killer (observed: the tab reloading
+  // itself mid-session) and causes GC hitches.
+  DEPTH_TARGET: 3,     // frames to keep in hand
+  DEPTH_PRIME: 2,      // wait for this many before the first frame is shown
+  DEPTH_SLACK: 2,      // beyond target+slack, consume 2 frames in one XR frame
   reset() {
-    try { if (this.decoder && this.decoder.state !== "closed") this.decoder.close(); } catch (e) {}
+    if (this.worker) {
+      try { this.worker.postMessage({ type: "reset" }); this.worker.terminate(); } catch (e) {}
+      this.worker = null;
+    }
     for (const f of this.queue) { try { f.close(); } catch (e) {} }
-    if (this.displayed) { try { this.displayed.close(); } catch (e) {} }
-    this.active = false; this.decoder = null; this.mp4 = null; this.cfg = null;
-    this.offset = 0; this.queue = []; this.pending = []; this.displayed = null;
-    this.lastAppendTs = null; this.clockOffset = null;
-    this.offsets = []; this.playhead = null; this._lastWall = null;
+    this.queue = []; this.active = false; this.primed = false; this.pendingDepth = 0;
   },
-  // Just-in-time decode pacing: segments arrive as ~1s bursts of encoded
-  // samples; decoding them all at once would either flood or starve the
-  // shallow VideoFrame queue. Decode only up to clock + 0.35s each tick.
-  pump() {
-    const clockSec = this.clock();
-    if (!this.decoder || this.decoder.state !== "configured") return;
-    // overflow guard (e.g. viewer paused): drop old GOPs up to a keyframe
-    if (this.pending.length > 900) {
-      let k = -1;
-      for (let i = this.pending.length - 600; i > 0; i--) {
-        if (this.pending[i] && this.pending[i].key) { k = i; break; }
+  ensureWorker() {
+    if (this.worker) return;
+    this.worker = new Worker("wcworker.js");
+    this.worker.onerror = (e) => { window.__wcErr = "worker: " + e.message; };
+    this.worker.onmessage = (e) => {
+      const m = e.data;
+      if (m.type === "frame") {
+        this._outCount++;
+        this.queue.push(m.frame);
+        while (this.queue.length > 8) { const f = this.queue.shift(); try { f.close(); } catch (err) {} }
+      } else if (m.type === "ready") {
+        this.active = true;
+      } else if (m.type === "depth") {
+        this.pendingDepth = m.pending;
+      } else if (m.type === "log") {
+        window.__wcErr = m.msg;
       }
-      if (k > 0) {
-        this.pending.splice(0, k);
-        try { this.decoder.reset(); this.decoder.configure(this.cfg); } catch (e) {}
-      }
-    }
-    while (this.pending.length &&
-           this.pending[0].ts / 1e6 <= clockSec + 0.35 &&
-           this.decoder.decodeQueueSize < 8 && this.queue.length < 8) {
-      const p = this.pending.shift();
-      try { this.decoder.decode(p.chunk); } catch (e) { window.__wcErr = "decode: " + e.message; }
-    }
+    };
+    this.worker.postMessage({ type: "credit", n: this.DEPTH_TARGET + this.DEPTH_SLACK });
   },
   feed(chunk) {                       // Uint8Array fMP4 bytes from hls.js
-    if (!window.VideoDecoder || !window.MP4Box) return;
-    if (!this.mp4) {
-      this.mp4 = MP4Box.createFile();
-      this.mp4.onError = (e) => { window.__wcErr = "mp4box: " + e; };
-      this.mp4.onReady = (info) => {
-        const tr = info.videoTracks && info.videoTracks[0];
-        if (!tr) return;
-        let desc = null;
-        try {
-          const trak = this.mp4.getTrackById(tr.id);
-          for (const entry of trak.mdia.minf.stbl.stsd.entries) {
-            const box = entry.avcC || entry.hvcC || entry.av1C || entry.vpcC;
-            if (box) {
-              const ds = new DataStream(undefined, 0, DataStream.BIG_ENDIAN);
-              box.write(ds);
-              desc = new Uint8Array(ds.buffer, 8);
-              break;
-            }
-          }
-        } catch (e) { window.__wcErr = "desc: " + e; }
-        this.decoder = new VideoDecoder({
-          output: (frame) => {
-            this._outCount++;
-            this.queue.push(frame);
-            while (this.queue.length > 12) { const f = this.queue.shift(); try { f.close(); } catch (e) {} }
-          },
-          error: (e) => { window.__wcErr = "decoder: " + e.message; this.active = false; },
-        });
-        const cfg = { codec: tr.codec, optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" };
-        if (desc) cfg.description = desc;
-        this.cfg = cfg;
-        try {
-          this.decoder.configure(cfg);
-          this.active = true;
-        } catch (e) { window.__wcErr = "configure: " + e.message; }
-        this.mp4.setExtractionOptions(tr.id, null, { nbSamples: 30 });
-        this.mp4.start();
-      };
-      this.mp4.onSamples = (id, user, samples) => {
-        for (const s of samples) {
-          const ts = Math.round(s.cts * 1e6 / s.timescale);
-          if (this.lastAppendTs == null || ts > this.lastAppendTs) this.lastAppendTs = ts;
-          this.pending.push({
-            ts, key: !!s.is_sync,
-            chunk: new EncodedVideoChunk({
-              type: s.is_sync ? "key" : "delta",
-              timestamp: ts,
-              duration: Math.round(s.duration * 1e6 / s.timescale),
-              data: s.data,
-            }),
-          });
-        }
-      };
-    }
-    const buf = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
-    buf.fileStart = this.offset;
-    this.offset += buf.byteLength;
-    try { this.mp4.appendBuffer(buf); } catch (e) { window.__wcErr = "append: " + e; }
+    if (!window.VideoDecoder) return;
+    this.ensureWorker();
+    // hls.js reuses its buffers, so copy once (a memcpy, ~2ms for 18MB) and
+    // transfer ownership to the worker - the 35-41ms demux happens there.
+    const copy = chunk.slice();
+    this.worker.postMessage({ type: "data", buf: copy.buffer }, [copy.buffer]);
   },
-  // newest frame not ahead of the (offset-corrected) clock; falls back to
-  // the newest available so startup shows video before the clock settles
+  pump() { /* the worker paces itself from display credits */ },
+  // One frame per call (i.e. per XR frame), in decode order. The caller closes
+  // the frame right after uploading it, so nothing is retained.
+  // Rate matching: the source is 72fps and the XR loop is ~72fps but not
+  // exactly, so error would accumulate into a periodic hitch. Instead, when
+  // the queue drifts deep we consume two frames in one XR frame (a single
+  // 14ms skip, imperceptible) and when it runs dry we simply hold the last
+  // frame. Corrections stay small and constant instead of rare and visible.
   pick() {
-    const clockSec = this.clock();
     if (!this.queue.length) return null;
-    let idx = -1;
-    for (let i = 0; i < this.queue.length; i++) {
-      if (this.queue[i].timestamp / 1e6 <= clockSec + 0.06) idx = i; else break;
+    if (!this.primed) {
+      if (this.queue.length < this.DEPTH_PRIME) return null;
+      this.primed = true;
     }
-    if (idx < 0 && this.queue.length > 8) idx = 0;   // clock stalled? don't starve
-    if (idx < 0) return null;
-    for (let i = 0; i < idx; i++) { const f = this.queue[i]; try { f.close(); } catch (e) {} }
-    this.queue.splice(0, idx);
+    if (this.queue.length > this.DEPTH_TARGET + this.DEPTH_SLACK) {
+      const stale = this.queue.shift();
+      try { stale.close(); } catch (e) {}
+      if (this.worker) this.worker.postMessage({ type: "credit", n: 1 });
+    }
     const f = this.queue.shift();
-    if (this.displayed) { try { this.displayed.close(); } catch (e) {} }
-    this.displayed = f;
+    this._dispCount++;
+    if (this.worker) this.worker.postMessage({ type: "credit", n: 1 });
     return f;
   },
 };
 setInterval(() => {
   wc.outPerSec = wc._outCount * 2; wc._outCount = 0;
-  if (wc.active) { wc.estimateOffset(); wc.pump(); }   // backup pump outside XR
+  wc.dispPerSec = wc._dispCount * 2; wc._dispCount = 0;
+  if (wc.active) wc.pump();   // backup pump outside XR
 }, 500);
 
 // ------------------------------------------------------------- buffered (MSE)
@@ -277,8 +198,8 @@ async function bufferedConnect() {
   }
   hls = new Hls({
     lowLatencyMode: true,
-    backBufferLength: 10,
-    maxBufferLength: 12,
+    backBufferLength: 4,
+    maxBufferLength: 6,
     liveSyncDurationCount: 2,
     maxLiveSyncPlaybackRate: 1.05,
   });
@@ -553,13 +474,13 @@ async function runGlDome() {
   }, 5000);
 
   // ---- HUD quad (head-locked, center of view) ----
-  const hudW = 1024, hudH = 192;
+  const hudW = 1600, hudH = 210;
   const hudCanvas = document.createElement("canvas");
   hudCanvas.width = hudW; hudCanvas.height = hudH;
   const hctx = hudCanvas.getContext("2d");
   const hudVbo = gl.createBuffer();
   {
-    const w = 1.05, h = w * hudH / hudW, z = -1.7, y = -0.02;
+    const w = 1.5, h = w * hudH / hudW, z = -1.7, y = -0.02;
     gl.bindBuffer(gl.ARRAY_BUFFER, hudVbo);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
       -w/2, y - h/2, z, 0, 1,   w/2, y - h/2, z, 1, 1,
@@ -594,12 +515,14 @@ async function runGlDome() {
     hctx.fillStyle = "rgba(10,14,20,0.72)";
     hctx.fillRect(0, 0, hudW, hudH);
     hctx.fillStyle = "#3ec3dc";
-    hctx.font = "bold 44px monospace";
-    const vsrc = wc.active ? `dec ${wc.outPerSec}fps q${wc.queue.length}+${wc.pending.length}` : `video ${live.vidFps}fps`;
-    hctx.fillText(`XR ${live.xrFps}fps  ${vsrc}  drop ${live.dropPs}/s  buf ${live.buf.toFixed(1)}s`, 18, 62);
+    hctx.font = "bold 42px monospace";
+    const vsrc = wc.active
+      ? `shown ${wc.dispPerSec} dec ${wc.outPerSec} q${wc.queue.length}+${wc.pendingDepth}`
+      : `video ${live.vidFps}fps`;
+    hctx.fillText(`XR ${live.xrFps}  ${vsrc}  drop ${live.dropPs}/s  buf ${live.buf.toFixed(1)}s`, 16, 60);
     hctx.fillStyle = "#e2eaf1";
-    hctx.fillText(`HMD ${d.fps ?? "-"}/${d.maxFps ?? "-"}fps stale ${d.stale ?? "-"}  GPU ${d.gpuBusy ?? "-"}% ${d.gpuMHz ?? "-"}MHz`, 18, 118);
-    hctx.fillText(`CPU L${d.cpuLvl ?? "-"} ${d.cpuMHz ?? "-"}MHz  ${d.temp ?? "-"}C  ${video.videoWidth}x${video.videoHeight}`, 18, 174);
+    hctx.fillText(`HMD ${d.fps ?? "-"}/${d.maxFps ?? "-"}fps stale ${d.stale ?? "-"}  GPU ${d.gpuBusy ?? "-"}% ${d.gpuMHz ?? "-"}MHz`, 16, 122);
+    hctx.fillText(`CPU L${d.cpuLvl ?? "-"} ${d.cpuMHz ?? "-"}MHz  ${d.temp ?? "-"}C  ${video.videoWidth}x${video.videoHeight}`, 16, 184);
     gl.bindTexture(gl.TEXTURE_2D, hudTex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, hudCanvas);
   }, 500);
@@ -642,6 +565,7 @@ async function runGlDome() {
       if (f) {
         gl.bindTexture(gl.TEXTURE_2D, videoTex);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, f);
+        try { f.close(); } catch (e) {}   // release immediately: 12.6MB per frame
       }
     } else if (video.readyState >= 2) {
       gl.bindTexture(gl.TEXTURE_2D, videoTex);
