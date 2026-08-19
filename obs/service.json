@@ -1,1 +1,1 @@
-{"type":"rtmp_custom","settings":{"server":"srt://127.0.0.1:9890?streamid=publish:vr180","key":"","use_auth":false}}
+{"type":"rtmp_custom","settings":{"server":"rtmp://127.0.0.1:1936","key":"vr180","use_auth":false}}

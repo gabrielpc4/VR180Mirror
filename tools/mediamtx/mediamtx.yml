@@ -20,7 +20,11 @@ apiAddress: 127.0.0.1:9998
 rtsp: true
 rtspAddress: 127.0.0.1:9554
 rtspTransports: [tcp]
-rtmp: false
+# RTMP ingest (TCP): lossless on loopback. SRT is UDP and was dropping
+# packets at 120-150 Mbps - corrupt slices and missing keyframes downstream.
+rtmp: true
+rtmpAddress: 127.0.0.1:1936
+rtmpEncryption: "no"
 # SRT ingest from OBS: reliable on loopback (recovers lost packets), unlike
 # WHIP's plain UDP which dropped RTP under 150 Mbps keyframe bursts
 srt: true
