@@ -180,7 +180,7 @@ function proxyHls(req, res, pathname, search) {
 function handler(req, res) {
   const u = new URL(req.url, "http://x");
   if (u.pathname === "/whep" || u.pathname.startsWith("/whep-res/")) return proxyWhep(req, res);
-  if (u.pathname.startsWith("/hls")) return proxyHls(req, res, u.pathname, u.search);
+  if (u.pathname === "/hls" || u.pathname.startsWith("/hls/")) return proxyHls(req, res, u.pathname, u.search);
   if (u.pathname === "/settings") return settings(req, res);
   if (u.pathname === "/deovr" || u.pathname === "/deovr.json") return deovr(req, res);
   if (u.pathname === "/info") {
