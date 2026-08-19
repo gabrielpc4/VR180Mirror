@@ -27,6 +27,8 @@ param(
     [int]$MaxBitrate = 0,
     # skip the bandwidth monitor window
     [switch]$NoMonitor,
+    # source render rate as a multiple of the stream fps (see below)
+    [double]$SourceFpsScale = 1.0,
     # classic full-180 canvas (needed for DeoVR; default is FOV-fit = sharper)
     [switch]$VR180
 )
@@ -168,9 +170,14 @@ if (Get-OurProcess "node.exe" "VR180Mirror\web\server.js") {
 if (Get-OurProcess "VR180Mirror.exe" "VR180Mirror") {
     Write-Host "VR180Mirror already running"
 } else {
-    # render at 2x the stream rate: OBS samples presented frames on its own clock,
-    # so a fresh frame must always be waiting or it captures duplicates
-    $mirrorArgs = @("--size","${canvasW}x${canvasH}","--fps","$($fps * 2)","--preview","1280")
+    # Source render rate. It matched the stream rate originally, was raised to 2x
+    # while the render loop still had stalls (a stalled loop makes the capture
+    # sample the same frame twice), and is back to 1x now that the stalls are
+    # gone: both our pacing and OBS derive from QPC, so at equal rates the phase
+    # barely drifts. 2x also costs the game GPU time - the capture hook copies
+    # the full 4096x2048 backbuffer on every present. Raise -SourceFpsScale if
+    # held frames ever reappear.
+    $mirrorArgs = @("--size","${canvasW}x${canvasH}","--fps","$([int]($fps * $SourceFpsScale))","--preview","1280")
     if ($VR180) { $mirrorArgs += "--vr180" }
     if ($TestGrid) { $mirrorArgs += "--test-grid" }
     Start-Process -FilePath "$root\bin\VR180Mirror.exe" -ArgumentList $mirrorArgs `

@@ -164,58 +164,77 @@ function parsePlaylist(txt, baseUrl) {
 
 async function startDirect(masterUrl) {
   fetcher = { running: true };
-  try {
-    // master -> video variant (MediaMTX puts audio in a separate rendition, so
-    // this variant is video-only, which is exactly what we want)
-    const masterTxt = await (await fetch(masterUrl, { cache: "no-store" })).text();
-    let variantUrl = masterUrl;
-    const ml = masterTxt.split(/\r?\n/);
-    for (let i = 0; i < ml.length; i++) {
-      if (ml[i].startsWith("#EXT-X-STREAM-INF")) {
-        for (let j = i + 1; j < ml.length; j++) {
-          const u = ml[j].trim();
-          if (u && !u.startsWith("#")) { variantUrl = new URL(u, masterUrl).href; break; }
-        }
-        break;
+  let fails = 0;
+  while (fetcher && fetcher.running) {
+    try {
+      await followStream(masterUrl);          // returns only if the feed stalls
+      fails = 0;
+    } catch (e) {
+      log("direct: " + e.message);
+      // HLS sessions expire (MediaMTX drops idle ones) and playlists roll; the
+      // cure is to re-resolve the master for a fresh session, not to give up.
+      if (++fails > 6) {
+        postMessage({ type: "direct-failed", msg: String(e.message || e) });
+        return;
       }
+      await new Promise((r) => setTimeout(r, 1000));
     }
-    postMessage({ type: "log", msg: "direct variant: " + variantUrl });
+  }
+}
 
-    let initFetched = false, nextSeq = -1, idle = 0;
-    while (fetcher && fetcher.running) {
-      const txt = await (await fetch(variantUrl, { cache: "no-store" })).text();
-      const pl = parsePlaylist(txt, variantUrl);
-      if (pl.initUri && !initFetched) { await fetchFeed(pl.initUri); initFetched = true; }
-      if (nextSeq < 0) {
-        // start one segment back from the live edge: enough to prime, minimal latency
-        nextSeq = pl.mediaSeq + Math.max(0, pl.segs.length - 2);
+async function followStream(masterUrl) {
+  // master -> video variant (MediaMTX puts audio in a separate rendition, so
+  // this variant is video-only, which is exactly what we want)
+  const mr = await fetch(masterUrl, { cache: "no-store" });
+  if (!mr.ok) throw new Error("master HTTP " + mr.status);
+  const masterTxt = await mr.text();
+  let variantUrl = masterUrl;
+  const ml = masterTxt.split(/\r?\n/);
+  for (let i = 0; i < ml.length; i++) {
+    if (ml[i].startsWith("#EXT-X-STREAM-INF")) {
+      for (let j = i + 1; j < ml.length; j++) {
+        const u = ml[j].trim();
+        if (u && !u.startsWith("#")) { variantUrl = new URL(u, masterUrl).href; break; }
       }
-      // Backpressure: with a big backlog, rejoin at the live edge instead of
-      // downloading more. Each segment starts with a keyframe, so this is a
-      // clean cut. Small drift is handled smoothly in drain() instead.
-      const latestSeq = pl.mediaSeq + Math.max(0, pl.segs.length - 1);
-      if (pending.length > SKIP_BACKLOG && latestSeq > nextSeq) {
-        log("resync: skipped " + (latestSeq - nextSeq) + " segment(s), backlog " + pending.length);
-        nextSeq = latestSeq;
-      }
-      let got = 0;
-      for (let k = 0; k < pl.segs.length; k++) {
-        const seq = pl.mediaSeq + k;
-        if (seq >= nextSeq) {
-          await fetchFeed(pl.segs[k]);
-          nextSeq = seq + 1;
-          got++;
-        }
-      }
-      // if the playlist rolled past us (we fell behind), rejoin at the edge
-      if (pl.mediaSeq > nextSeq) nextSeq = pl.mediaSeq;
-      idle = got ? 0 : idle + 1;
-      await new Promise((r) => setTimeout(r, got ? 120 : 250));
-      if (idle > 120) throw new Error("playlist produced no segments");
+      break;
     }
-  } catch (e) {
-    log("direct: " + e.message);
-    postMessage({ type: "direct-failed", msg: String(e.message || e) });
+  }
+  postMessage({ type: "log", msg: "direct variant: " + variantUrl });
+
+  let initFetched = false, nextSeq = -1, idle = 0;
+  while (fetcher && fetcher.running) {
+    const pr = await fetch(variantUrl, { cache: "no-store" });
+    if (!pr.ok) throw new Error("variant HTTP " + pr.status);   // session gone
+    const pl = parsePlaylist(await pr.text(), variantUrl);
+    if (pl.initUri && !initFetched) { await fetchFeed(pl.initUri); initFetched = true; }
+    if (nextSeq < 0) {
+      // start one segment back from the live edge: enough to prime, minimal latency
+      nextSeq = pl.mediaSeq + Math.max(0, pl.segs.length - 2);
+    }
+
+    // Backpressure: with a big backlog, rejoin at the live edge instead of
+    // downloading more. Each segment starts with a keyframe, so this is a
+    // clean cut. Small drift is handled smoothly by the page shedding frames.
+    const latestSeq = pl.mediaSeq + Math.max(0, pl.segs.length - 1);
+    if (pending.length > SKIP_BACKLOG && latestSeq > nextSeq) {
+      log("resync: skipped " + (latestSeq - nextSeq) + " segment(s), backlog " + pending.length);
+      nextSeq = latestSeq;
+    }
+
+    let got = 0;
+    for (let k = 0; k < pl.segs.length; k++) {
+      const seq = pl.mediaSeq + k;
+      if (seq >= nextSeq) {
+        await fetchFeed(pl.segs[k]);
+        nextSeq = seq + 1;
+        got++;
+      }
+    }
+    // if the playlist rolled past us (we fell behind), rejoin at the edge
+    if (pl.mediaSeq > nextSeq) nextSeq = pl.mediaSeq;
+    idle = got ? 0 : idle + 1;
+    await new Promise((r) => setTimeout(r, got ? 120 : 250));
+    if (idle > 60) throw new Error("no new segments");   // re-resolve the master
   }
 }
 

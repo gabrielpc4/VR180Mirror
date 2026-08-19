@@ -29,7 +29,7 @@
 #include <windows.h>
 #include <timeapi.h>
 #include <d3d11.h>
-#include <dxgi1_2.h>
+#include <dxgi1_6.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
@@ -84,6 +84,7 @@ static void logf(const char* fmt, ...);
 static FILETIME g_rtWriteTime = {};
 static std::atomic<long long> g_presentCount{0};   // total presents, for rate reporting
 static std::atomic<int> g_presentFps{0};
+static bool g_tearing = false;   // swapchain created with ALLOW_TEARING
 static void pollRuntimeFile() {
     static char path[MAX_PATH] = {};
     if (!path[0]) {
@@ -401,6 +402,11 @@ static bool vrAcquireMirror() {
     return true;
 }
 
+// Anything that can block belongs off the render thread: a stalled render loop
+// means the capture samples the same frame twice. VR_Init against a runtime
+// that is not running took long enough to cost a frame every few seconds.
+static std::atomic<bool> g_wantMirror{false};
+
 static void vrTryConnect() {
     ULONGLONG now = GetTickCount64();
     if (now < vrs.nextRetryTick) return;
@@ -430,9 +436,18 @@ static void vrTryConnect() {
         vrs.projR[0], vrs.projR[1], vrs.projR[2], vrs.projR[3]);
     vrs.connected = true;
     vrs.nextRefreshTick = 0;
-    vrAcquireMirror();
+    g_wantMirror.store(true, std::memory_order_relaxed);
 }
 
+// Render-thread half: only the mirror acquisition, which needs the D3D device.
+static void vrPumpRender() {
+    if (vrs.connected && !vrs.haveMirror && g_wantMirror.load(std::memory_order_relaxed)) {
+        g_wantMirror.store(false, std::memory_order_relaxed);
+        vrAcquireMirror();
+    }
+}
+
+// I/O-thread half: connect, events, projection refresh.
 static void vrPump() {
     if (!vrs.connected) { vrTryConnect(); return; }
 
@@ -456,12 +471,9 @@ static void vrPump() {
 
     ULONGLONG now = GetTickCount64();
     if (now >= vrs.nextRefreshTick) {
-        vrs.nextRefreshTick = now + 15000;
+        vrs.nextRefreshTick = vrs.haveMirror ? now + 15000 : now + 2000;
         vrRefreshProjection();
-        if (!vrs.haveMirror && !vrAcquireMirror()) {
-            // compositor might not be serving frames yet; retry sooner
-            vrs.nextRefreshTick = now + 2000;
-        }
+        if (!vrs.haveMirror) g_wantMirror.store(true, std::memory_order_relaxed);
     }
 }
 
@@ -708,6 +720,20 @@ int main(int argc, char** argv) {
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.BufferCount = 3;   // 3 buffers: never let a flip stall the render loop
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    // Allow tearing: without it a windowed flip swapchain paces presents against
+    // the desktop compositor, so an occasional Present blocks past the frame
+    // budget. The capture then samples the same frame twice (measured: ~1% of
+    // frames held). We are never scanned out directly, so tearing is moot here.
+    {
+        Microsoft::WRL::ComPtr<IDXGIFactory5> f5;
+        BOOL allow = FALSE;
+        if (SUCCEEDED(factory.As(&f5)) &&
+            SUCCEEDED(f5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow, sizeof(allow))) &&
+            allow) {
+            sd.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+            g_tearing = true;
+        }
+    }
     sd.Scaling = DXGI_SCALING_STRETCH;   // backbuffer stays full-res; DWM scales to window
     if (FAILED(factory->CreateSwapChainForHwnd(g.dev.Get(), hwnd, &sd, nullptr, nullptr, &g.swap))) {
         logf("CreateSwapChain failed"); return 1;
@@ -759,10 +785,24 @@ int main(int argc, char** argv) {
     // stall, and a stalled render loop means a duplicated frame downstream.
     std::atomic<bool> ioRun{true};
     std::thread ioThread([&ioRun]() {
+        long long lastCount = 0;
+        ULONGLONG lastTick = GetTickCount64();
         while (ioRun.load(std::memory_order_relaxed)) {
+            vrPump();                       // connect / events / projection
             pollRuntimeFile();
             writeStatusFile();
-            Sleep(500);
+
+            const ULONGLONG nowTick = GetTickCount64();
+            if (nowTick - lastTick >= 5000) {
+                const long long c = g_presentCount.load(std::memory_order_relaxed);
+                const double rate = (c - lastCount) * 1000.0 / (nowTick - lastTick);
+                g_presentFps.store((int)(rate + 0.5), std::memory_order_relaxed);
+                logf("present rate: %.1f fps (target %d)%s", rate, g_cfg.fps,
+                     g_tearing ? " [tearing]" : "");
+                lastCount = c;
+                lastTick = nowTick;
+            }
+            Sleep(200);
         }
     });
 
@@ -782,7 +822,7 @@ int main(int argc, char** argv) {
         }
         if (g_quit) break;
 
-        vrPump();
+        vrPumpRender();
 
         bool live = vrs.haveMirror && !g_cfg.testGrid;
         if (live != wasLive) {
@@ -796,20 +836,13 @@ int main(int argc, char** argv) {
         QueryPerformanceCounter(&qpc);
         double now = double(qpc.QuadPart - qpc0.QuadPart) / qpf.QuadPart;
         renderFrame(now);
-        g.swap->Present(0, 0);
+        g.swap->Present(0, g_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
 
         // present-rate report: a source that misses its target duplicates
         // frames downstream, so make the actual rate visible
+        // No logging here: a console write blocks for milliseconds, which costs
+        // a frame. Publish the count; the I/O thread turns it into a rate.
         g_presentCount.fetch_add(1, std::memory_order_relaxed);
-        static int fpsFrames = 0;
-        static double fpsSince = 0.0;
-        if (++fpsFrames >= 300) {
-            const double rate = fpsFrames / (now - fpsSince);
-            g_presentFps.store((int)(rate + 0.5), std::memory_order_relaxed);
-            logf("present rate: %.1f fps (target %d)", rate, g_cfg.fps);
-            fpsFrames = 0;
-            fpsSince = now;
-        }
 
         // pacing
         nextT += period;
