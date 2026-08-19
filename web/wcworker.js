@@ -41,6 +41,16 @@ const PENDING_MAX = 260;     // chunks (~3.6s): hard safety, GOP skip
 
 const log = (m) => postMessage({ type: "log", msg: String(m) });
 
+// A new HLS session means a new init segment. mp4box parses one contiguous
+// byte stream, so feeding it a second moov at a later offset corrupts it for
+// good ("Cannot read properties of undefined") and the picture freezes. Start
+// a fresh parser instead whenever the stream restarts.
+function resetParser() {
+  try { if (decoder && decoder.state !== "closed") decoder.close(); } catch (e) {}
+  mp4 = null; decoder = null; cfg = null; offset = 0;
+  pending = []; outstanding = 0; credits = INFLIGHT_CAP;
+}
+
 function ensureFile() {
   if (mp4) return;
   mp4 = MP4Box.createFile();
@@ -63,6 +73,7 @@ function ensureFile() {
       }
     } catch (e) { log("desc: " + e); }
 
+    try { if (decoder && decoder.state !== "closed") decoder.close(); } catch (e) {}
     decoder = new VideoDecoder({
       output: (frame) => { outstanding++; postMessage({ type: "frame", frame }, [frame]); },
       error: (e) => log("decoder: " + e.message),
@@ -132,7 +143,12 @@ function drain() {
 let fetcher = null;
 
 async function fetchFeed(url) {
-  const resp = await fetch(url, { cache: "no-store" });
+  let resp;
+  try {
+    resp = await fetch(url, { cache: "no-store" });
+  } catch (e) {
+    throw new Error((e && e.message ? e.message : e) + " fetching " + url);
+  }
   if (!resp.ok) throw new Error("HTTP " + resp.status + " for " + url);
   const buf = await resp.arrayBuffer();
   ensureFile();
@@ -143,6 +159,8 @@ async function fetchFeed(url) {
     mp4.flush();
   } catch (e) {
     log("append(" + buf.byteLength + "B): " + (e && e.message ? e.message : e));
+    resetParser();                 // unusable parser: rebuild on the next init
+    throw new Error("parser reset after append failure");
   }
   drain();
 }
@@ -190,7 +208,12 @@ async function startDirect(masterUrl) {
 async function followStream(masterUrl) {
   // master -> video variant (MediaMTX puts audio in a separate rendition, so
   // this variant is video-only, which is exactly what we want)
-  const mr = await fetch(masterUrl, { cache: "no-store" });
+  let mr;
+  try {
+    mr = await fetch(masterUrl, { cache: "no-store" });
+  } catch (e) {
+    throw new Error((e && e.message ? e.message : e) + " fetching master " + masterUrl);
+  }
   if (!mr.ok) throw new Error("master HTTP " + mr.status);
   const masterTxt = await mr.text();
   let variantUrl = masterUrl;
@@ -206,9 +229,16 @@ async function followStream(masterUrl) {
   }
   postMessage({ type: "log", msg: "direct variant: " + variantUrl });
 
+  // fresh session -> fresh parser, so byte offsets stay contiguous
+  resetParser();
   let initFetched = false, nextSeq = -1, idle = 0;
   while (fetcher && fetcher.running) {
-    const pr = await fetch(variantUrl, { cache: "no-store" });
+    let pr;
+    try {
+      pr = await fetch(variantUrl, { cache: "no-store" });
+    } catch (e) {
+      throw new Error((e && e.message ? e.message : e) + " fetching variant " + variantUrl);
+    }
     if (!pr.ok) throw new Error("variant HTTP " + pr.status);   // session gone
     const pl = parsePlaylist(await pr.text(), variantUrl);
     if (pl.initUri && !initFetched) { await fetchFeed(pl.initUri); initFetched = true; }
@@ -248,11 +278,20 @@ onmessage = (e) => {
   if (m.type === "direct") {
     startDirect(m.url);
   } else if (m.type === "data") {
+    // chunks from the hls.js fallback. If the direct fetcher owns the parser,
+    // stop it and start clean - two sources appending into one mp4box parser
+    // corrupts it permanently ("Cannot read properties of undefined").
+    if (fetcher && fetcher.running) { fetcher.running = false; fetcher = null; resetParser(); }
     ensureFile();
     const buf = m.buf;                 // transferred ArrayBuffer (no copy here)
     buf.fileStart = offset;
     offset += buf.byteLength;
-    try { mp4.appendBuffer(buf); } catch (err) { log("append: " + err); }
+    try {
+      mp4.appendBuffer(buf);
+    } catch (err) {
+      log("append(mse, " + buf.byteLength + "B): " + (err && err.message ? err.message : err));
+      resetParser();
+    }
     drain();
   } else if (m.type === "credit") {
     // the page consumed or shed a frame: it is no longer outstanding, and we

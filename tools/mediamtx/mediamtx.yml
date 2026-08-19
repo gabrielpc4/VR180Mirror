@@ -47,7 +47,7 @@ webrtcLocalTCPAddress: :9189
 # Advertise loopback (for local OBS publisher) + the LAN IP (for the Quest).
 # Start-Spectator.ps1 rewrites the LAN entry to the current address on launch.
 webrtcIPsFromInterfaces: false
-webrtcAdditionalHosts: [127.0.0.1, 192.168.15.37]
+webrtcAdditionalHosts: [127.0.0.1, 192.168.15.136]
 
 hls: true
 hlsAddress: :9888

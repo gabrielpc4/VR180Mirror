@@ -182,6 +182,20 @@ function handler(req, res) {
   if (u.pathname === "/whep" || u.pathname.startsWith("/whep-res/")) return proxyWhep(req, res);
   if (u.pathname === "/hls" || u.pathname.startsWith("/hls/")) return proxyHls(req, res, u.pathname, u.search);
   if (u.pathname === "/settings") return settings(req, res);
+  if (u.pathname === "/clientlog" && req.method === "POST") {
+    // The viewer runs on the headset, so its errors used to be invisible here.
+    // They now land in this console window and in web/client.log.
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const line = "[viewer " + new Date().toLocaleTimeString() + "] "
+        + Buffer.concat(chunks).toString().slice(0, 500);
+      console.log(line);
+      try { fs.appendFileSync(path.join(ROOT, "client.log"), line + String.fromCharCode(10)); } catch (e) {}
+      res.writeHead(204); res.end();
+    });
+    return;
+  }
   if (u.pathname === "/devstats") {
     res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
     res.end(JSON.stringify(dev));
