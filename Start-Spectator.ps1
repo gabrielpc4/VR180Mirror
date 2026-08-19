@@ -43,10 +43,14 @@ function Test-OurObs {
 }
 
 $fps = 72
-# 4096-wide is the XR media layer's reliable fast-path size on Quest; FOV-fit
-# packs the game's ~110 degrees into it (~94% of panel-native detail).
+# 6144x3072 is the native target: 3072 px per eye over the game's ~114 deg is
+# ~27 px/deg, past the Quest 3 panel's ~25 PPD, so the display is the limit
+# rather than the stream. It is also ~1:1 with Virtual Desktop Godlike's
+# 3072x3216 per-eye render, so the reprojection resamples as little as possible.
+# (The old 4096 cap came from XRMediaBinding's fast path; we render the dome
+# ourselves now, so that limit no longer applies.)
 if ($Codec -eq "av1")      { $canvasW = 4096; $canvasH = 2048; $encoderId = "obs_nvenc_av1_tex";  $defBitrate = 150000 }
-elseif ($Codec -eq "hevc") { $canvasW = 4096; $canvasH = 2048; $encoderId = "obs_nvenc_hevc_tex"; $defBitrate = 150000 }
+elseif ($Codec -eq "hevc") { $canvasW = 6144; $canvasH = 3072; $encoderId = "obs_nvenc_hevc_tex"; $defBitrate = 240000 }
 else                  { $canvasW = 3840; $canvasH = 1920; $encoderId = "obs_nvenc_h264_tex"; $defBitrate = 100000 }
 if ($Bitrate -le 0) { $Bitrate = $defBitrate }
 
@@ -151,7 +155,7 @@ if (Get-OurProcess "mediamtx.exe" "VR180Mirror") {
     if (Test-Listening 9889) { throw "Port 9889 is already in use by something else" }
     Start-Process -FilePath "$root\tools\mediamtx\mediamtx.exe" `
         -ArgumentList "`"$root\tools\mediamtx\mediamtx.yml`"" `
-        -WorkingDirectory "$root\tools\mediamtx" -WindowStyle Minimized
+        -WorkingDirectory "$root\tools\mediamtx"
     Write-Host "MediaMTX started (WHIP/WHEP :9889, LL-HLS :9888)"
 }
 
@@ -160,7 +164,7 @@ if (Get-OurProcess "node.exe" "VR180Mirror\web\server.js") {
     Write-Host "Web server already running"
 } else {
     Start-Process -FilePath "node" -ArgumentList "`"$root\web\server.js`"","--ip",$lanIp `
-        -WorkingDirectory "$root\web" -WindowStyle Minimized
+        -WorkingDirectory "$root\web"                      # visible console
     Write-Host "Web server started (https :8443, http :9080)"
 }
 

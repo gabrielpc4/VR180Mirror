@@ -125,7 +125,7 @@ const wc = {
   // deep queue trips Android's low-memory killer (observed: the tab reloading
   // itself mid-session) and causes GC hitches.
   DEPTH_PRIME: 2,       // frames to have in hand before the first is shown
-  BACKLOG_DRIFT: 110,   // undecoded chunks (~1.5s) that mean we are behind
+  BACKLOG_DRIFT: 170,   // undecoded chunks (~2.4s) that mean we are behind
   CATCHUP_EVERY: 8,     // while behind, shed 1 frame per this many shown (~9/s)
   _catchup: 0,
   reset() {
@@ -150,7 +150,7 @@ const wc = {
         // deliberately while a backlog exists), shed the oldest frame here -
         // one frame at a time, which is invisible, instead of letting the
         // backlog grow into a visible jump.
-        while (this.queue.length > 6) {
+        while (this.queue.length > 5) {
           const f = this.queue.shift();
           this._discCount++;
           try { f.close(); } catch (err) {}
@@ -506,10 +506,28 @@ async function runGlDome() {
   // would otherwise pay every frame. Missing the frame deadline makes the
   // headset compositor re-project a stale frame, which reads as micro-stutter
   // (the HUD's "stale" counter was showing 1-6 per second).
-  const glLayerInit = { antialias: false, depth: false, stencil: false, alpha: false };
+  // Resolution ceiling #1: the XR framebuffer. The default scale is the
+  // runtime's *recommended* size, which is well below the panel's native
+  // resolution - everything we draw gets resampled down to it. Ask for the
+  // native scale (and a little more when allowed) so the video's pixels
+  // actually reach the display. Foveation is off: it deliberately blurs the
+  // periphery, which is exactly the sharpness we are chasing.
+  let fbScale = 1.0;
+  try {
+    const nat = XRWebGLLayer.getNativeFramebufferScaleFactor(xrSession);
+    if (nat > 0) fbScale = nat * SUPERSAMPLE;
+  } catch (e) {}
+  // No MSAA: measured on this scene it cost the frame budget (p99 16.2ms ->
+  // 41.0ms) while smoothing only the dome border and the HUD panel - the
+  // picture is texture sampling, which MSAA does not affect.
+  const glLayerInit = {
+    antialias: false, depth: false, stencil: false, alpha: false,
+    framebufferScaleFactor: fbScale,
+  };
   const baseLayer = new XRWebGLLayer(xrSession, gl, glLayerInit);
-  try { baseLayer.fixedFoveation = 1; } catch (e) {}   // cheaper periphery on Quest
+  try { baseLayer.fixedFoveation = 0; } catch (e) {}   // no foveal blur
   xrSession.updateRenderState({ baseLayer });
+  window.__fb = { scale: fbScale, w: baseLayer.framebufferWidth, h: baseLayer.framebufferHeight };
 
   const compile = (type, src) => {
     const s = gl.createShader(type);
@@ -543,7 +561,7 @@ async function runGlDome() {
   const domeVbo = gl.createBuffer(), domeIbo = gl.createBuffer();
   let domeCount = 0;
   function buildDome() {
-    const R = 36, C = 72, rad = 40;
+    const R = 96, C = 192, rad = 40;
     const verts = [], idx = [];
     for (let r = 0; r <= R; r++) {
       const lat = spans.v * (0.5 - r / R);
@@ -636,7 +654,9 @@ async function runGlDome() {
     hctx.fillText(line1, 16, 60);
     hctx.fillStyle = "#e2eaf1";
     hctx.fillText(`HMD ${d.fps ?? "-"}/${d.maxFps ?? "-"}fps stale ${d.stale ?? "-"}  GPU ${d.gpuBusy ?? "-"}% ${d.gpuMHz ?? "-"}MHz`, 16, 122);
-    const dim = wc.active ? `${wc.w || "?"}x${wc.h || "?"}` : `${video.videoWidth}x${video.videoHeight}`;
+    const fb = window.__fb;
+    const dim = (wc.active ? `${wc.w || "?"}x${wc.h || "?"}` : `${video.videoWidth}x${video.videoHeight}`)
+      + (fb ? `  fb ${fb.w}x${fb.h} (${fb.scale.toFixed(2)}x)` : "");
     const lat = wc.active ? `  lat ${((wc.queue.length + wc.pendingDepth) / 72).toFixed(1)}s` : "";
     hctx.fillText(`CPU L${d.cpuLvl ?? "-"} ${d.cpuMHz ?? "-"}MHz  ${d.temp ?? "-"}C  ${dim}${lat}`, 16, 184);
     gl.bindTexture(gl.TEXTURE_2D, hudTex);
@@ -775,6 +795,14 @@ setInterval(async () => {
 // late frames wait in the buffer instead of being dropped. Combined with the
 // USB path's TCP transport (lossless), hiccups become latency, not skips.
 const DELAY_TARGET_MS = 1500;
+// Framebuffer supersample on top of the native scale. 1.0 = native panel
+// pixels; >1 renders larger and lets the compositor downsample (sharper edges,
+// more fill rate). Overridable with ?ss=1.25 for experiments.
+// 1.6 makes the framebuffer 3072 px per eye - 1:1 with the 6144x3072 stream,
+// so nothing is downsampled at the last step. Measured on Quest 3: p99 frame
+// interval 16.0ms, 0 stale compositor frames, GPU 28%.
+const SUPERSAMPLE = Math.min(2.0, Math.max(0.8,
+  parseFloat(new URLSearchParams(location.search).get("ss")) || 1.6));
 function applyDelayPref() {
   if (!pc) return;
   const target = $("delaypref").checked ? DELAY_TARGET_MS : 0;

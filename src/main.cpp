@@ -287,6 +287,7 @@ struct VRState {
     float rotR[9]  = { 1,0,0, 0,1,0, 0,0,1 };
     bool  connected = false;
     bool  haveMirror = false;
+    uint32_t mirrorW = 0, mirrorH = 0;   // source size, for the sampling decision
     float hSpanRad = 3.14159265f;   // canvas angular coverage (FOV-fit mode)
     float vSpanRad = 3.14159265f;
     ULONGLONG nextRetryTick = 0;
@@ -396,6 +397,7 @@ static bool vrAcquireMirror() {
     ComPtr<ID3D11Texture2D> tex;
     if (SUCCEEDED(res.As(&tex))) {
         D3D11_TEXTURE2D_DESC td{}; tex->GetDesc(&td);
+        vrs.mirrorW = td.Width; vrs.mirrorH = td.Height;
         logf("Mirror acquired: %ux%u fmt=%d srgb=%d", td.Width, td.Height, (int)td.Format, (int)vrs.mirrorSrgb);
     }
     vrs.haveMirror = true;
@@ -517,7 +519,12 @@ static void renderFrame(double timeSec) {
     cb.params0[2] = (float)timeSec;
     cb.params0[3] = g_cfg.swapEyes ? 1.0f : 0.0f;
     cb.params1[0] = g_cfg.flipV ? 1.0f : 0.0f;
-    cb.params1[1] = g_cfg.supersample ? 4.0f : 1.0f;
+    // Sampling taps: a 2x2 box filter is right when the canvas is smaller than
+    // the source (clean downsample), but it SOFTENS the image at 1:1. Decide
+    // from the actual ratio instead of assuming.
+    const uint32_t halfW = (uint32_t)g_cfg.width / 2u;
+    const bool downscaling = vrs.mirrorW > 0 && halfW < (uint32_t)(vrs.mirrorW * 0.9f);
+    cb.params1[1] = (g_cfg.supersample && downscaling) ? 4.0f : 1.0f;
     cb.params1[2] = 2.0f / g_cfg.width;    // per-eye u units per output pixel
     cb.params1[3] = 1.0f / g_cfg.height;
     cb.params2[0] = vrs.hSpanRad;

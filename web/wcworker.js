@@ -35,7 +35,7 @@ let credits = 0, bonus = 0;
 // by the page shedding frames while the backlog is high (it reports the backlog
 // in the HUD as q<queue>+<pending>), which keeps the two mechanisms from
 // fighting each other.
-const INFLIGHT_CAP = 5;      // decoded frames posted but not yet consumed
+const INFLIGHT_CAP = 4;      // decoded frames posted but not yet consumed
 const SKIP_BACKLOG = 200;    // chunks (~2.8s): fetcher rejoins at the live edge
 const PENDING_MAX = 260;     // chunks (~3.6s): hard safety, GOP skip
 
@@ -138,7 +138,12 @@ async function fetchFeed(url) {
   ensureFile();
   buf.fileStart = offset;
   offset += buf.byteLength;
-  try { mp4.appendBuffer(buf); } catch (e) { log("append: " + e); }
+  try {
+    mp4.appendBuffer(buf);
+    mp4.flush();
+  } catch (e) {
+    log("append(" + buf.byteLength + "B): " + (e && e.message ? e.message : e));
+  }
   drain();
 }
 
