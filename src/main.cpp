@@ -65,6 +65,7 @@ struct Config {
     bool     swapEyes    = false;
     bool     topmost     = false;
     bool     supersample = true;   // 2x2 box taps: cleaner downsample of supersampled mirrors
+    bool     fitFov      = true;   // pack only the rendered FOV into the canvas (no black bars)
     float    featherDeg  = 1.5f;
     std::string dumpFrame;
 };
@@ -133,6 +134,7 @@ cbuffer CB : register(b0) {
     row_major float4x4 h2eR;
     float4 params0;           // x: feather (tangent units), y: gridMode, z: time s, w: swapEyes
     float4 params1;           // x: flipV, y: ss taps (1|4), zw: output pixel in per-eye uv
+    float4 params2;           // x: horizontal span (rad), y: vertical span (rad)
 };
 
 static const float PI = 3.14159265358979f;
@@ -148,9 +150,11 @@ VSOut vsmain(uint id : SV_VertexID) {
 }
 
 // Per-eye equirect coords -> head-space direction. x right, y up, -z forward.
+// The canvas spans params2.xy radians (FOV-fit mode packs only the rendered
+// FOV instead of a full 180, so no pixels are wasted on black).
 float3 dirFromEquirect(float2 e) {
-    float lon = (e.x - 0.5) * PI;      // -90..+90 deg
-    float lat = (0.5 - e.y) * PI;      // +90 top .. -90 bottom
+    float lon = (e.x - 0.5) * params2.x;
+    float lat = (0.5 - e.y) * params2.y;
     float cl = cos(lat);
     return float3(cl * sin(lon), sin(lat), -cl * cos(lon));
 }
@@ -195,8 +199,8 @@ float4 sampleEye(Texture2D tex, float4 tans, float3x3 h2e, float2 e) {
 // sweeping longitude bar for motion/latency, eye-exclusive squares to verify
 // eye routing (L-only box on the left, R-only box on the right).
 float4 grid(float2 e, bool isRight) {
-    float lonD = (e.x - 0.5) * 180.0;
-    float latD = (0.5 - e.y) * 180.0;
+    float lonD = (e.x - 0.5) * degrees(params2.x);
+    float latD = (0.5 - e.y) * degrees(params2.y);
 
     float2 cell = float2(lonD / 10.0, latD / 10.0);
     float2 g = abs(frac(cell + 0.5) - 0.5) / fwidth(cell);
@@ -245,6 +249,7 @@ struct CBData {
     float h2eR[16];
     float params0[4];
     float params1[4];
+    float params2[4];
 };
 
 // ----------------------------------------------------------------------------
@@ -277,9 +282,55 @@ struct VRState {
     float rotR[9]  = { 1,0,0, 0,1,0, 0,0,1 };
     bool  connected = false;
     bool  haveMirror = false;
+    float hSpanRad = 3.14159265f;   // canvas angular coverage (FOV-fit mode)
+    float vSpanRad = 3.14159265f;
     ULONGLONG nextRetryTick = 0;
     ULONGLONG nextRefreshTick = 0;
 } vrs;
+
+// Publish the active canvas spans for the viewer (bin\mirror_status.json,
+// served through the web server's /info) so the dome layer uses matching angles.
+static void writeStatusFile() {
+    static char path[MAX_PATH] = {};
+    if (!path[0]) {
+        GetModuleFileNameA(nullptr, path, MAX_PATH);
+        char* slash = strrchr(path, '\\');
+        if (slash) strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "mirror_status.json");
+    }
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "wb") == 0 && f) {
+        fprintf(f, "{\"hspan\":%.1f,\"vspan\":%.1f,\"live\":%d}",
+            vrs.hSpanRad * 180.0f / 3.14159265f,
+            vrs.vSpanRad * 180.0f / 3.14159265f,
+            vrs.haveMirror ? 1 : 0);
+        fclose(f);
+    }
+}
+
+// FOV-fit: size the canvas span to the union of both eyes' frustums (relative
+// to head-forward) plus a small margin, so no canvas width is spent on black.
+static void computeSpans() {
+    const float PI_ = 3.14159265f;
+    float h = PI_, v = PI_;
+    if (g_cfg.fitFov && vrs.connected) {
+        float maxH = 0.0f, maxV = 0.0f;
+        const float* projs[2] = { vrs.projL, vrs.projR };
+        for (const float* p : projs) {
+            maxH = std::max(maxH, std::max(fabsf(atanf(p[0])), fabsf(atanf(p[1]))));
+            maxV = std::max(maxV, std::max(fabsf(atanf(p[2])), fabsf(atanf(p[3]))));
+        }
+        const float margin = 6.0f * PI_ / 180.0f;
+        h = std::min(PI_, 2.0f * maxH + margin);
+        v = std::min(PI_, 2.0f * maxV + margin);
+    }
+    if (fabsf(h - vrs.hSpanRad) > 0.002f || fabsf(v - vrs.vSpanRad) > 0.002f) {
+        vrs.hSpanRad = h;
+        vrs.vSpanRad = v;
+        logf("canvas span: %.1f x %.1f deg%s", h * 180.0f / PI_, v * 180.0f / PI_,
+            (g_cfg.fitFov && vrs.connected) ? " (FOV-fit)" : " (full 180)");
+    }
+    writeStatusFile();
+}
 
 static void vrReleaseMirror() {
     // Deliberately do NOT call ReleaseMirrorTextureD3D11: per-cycle
@@ -299,6 +350,7 @@ static void vrDisconnect(const char* why) {
     vrs.comp = nullptr;
     vrs.connected = false;
     vrs.nextRetryTick = GetTickCount64() + 3000;
+    computeSpans();
 }
 
 static void mat34ToHeadToEye(const vr::HmdMatrix34_t& m, float out9[9]) {
@@ -314,6 +366,7 @@ static void vrRefreshProjection() {
     vrs.sys->GetProjectionRaw(vr::Eye_Right, &vrs.projR[0], &vrs.projR[1], &vrs.projR[2], &vrs.projR[3]);
     mat34ToHeadToEye(vrs.sys->GetEyeToHeadTransform(vr::Eye_Left),  vrs.rotL);
     mat34ToHeadToEye(vrs.sys->GetEyeToHeadTransform(vr::Eye_Right), vrs.rotR);
+    computeSpans();
 }
 
 static bool vrAcquireMirror() {
@@ -340,6 +393,7 @@ static bool vrAcquireMirror() {
         logf("Mirror acquired: %ux%u fmt=%d srgb=%d", td.Width, td.Height, (int)td.Format, (int)vrs.mirrorSrgb);
     }
     vrs.haveMirror = true;
+    writeStatusFile();
     return true;
 }
 
@@ -450,6 +504,8 @@ static void renderFrame(double timeSec) {
     cb.params1[1] = g_cfg.supersample ? 4.0f : 1.0f;
     cb.params1[2] = 2.0f / g_cfg.width;    // per-eye u units per output pixel
     cb.params1[3] = 1.0f / g_cfg.height;
+    cb.params2[0] = vrs.hSpanRad;
+    cb.params2[1] = vrs.vSpanRad;
 
     D3D11_MAPPED_SUBRESOURCE map;
     if (SUCCEEDED(g.ctx->Map(g.cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
@@ -579,6 +635,7 @@ int main(int argc, char** argv) {
         else if (a == "--swap-eyes") { g_cfg.swapEyes = true; }
         else if (a == "--topmost") { g_cfg.topmost = true; }
         else if (a == "--no-ss") { g_cfg.supersample = false; }
+        else if (a == "--vr180") { g_cfg.fitFov = false; }   // classic full-180 canvas
         else if (a == "--feather") { g_cfg.featherDeg = (float)atof(next()); }
         else if (a == "--dump-frame") { g_cfg.dumpFrame = next(); }
         else if (a == "--help" || a == "-h") {
@@ -596,6 +653,7 @@ int main(int argc, char** argv) {
     setGpuPriority();
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
     timeBeginPeriod(1);
+    computeSpans();   // publish initial (full-180) spans for the viewer
 
     logf("VR180Mirror starting: %dx%d @ %d fps (SBS half 180 equirect)",
         g_cfg.width, g_cfg.height, g_cfg.fps);

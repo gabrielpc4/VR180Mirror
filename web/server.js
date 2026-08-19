@@ -186,9 +186,13 @@ function handler(req, res) {
   if (u.pathname === "/info") {
     // Enriched status for the Quest launcher app: is the ingest live, which codec.
     const send = (extra) => {
+      // canvas spans published by VR180Mirror.exe (FOV-fit mode)
+      let spans = {};
+      try { spans = JSON.parse(fs.readFileSync(path.join(ROOT, "..", "bin", "mirror_status.json"), "utf8")); } catch (e) {}
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       res.end(JSON.stringify({ app: "vr180mirror", lanIp, stream: STREAM_PATH,
-        httpsPort: HTTPS_PORT, httpPort: HTTP_PORT, ...extra }));
+        httpsPort: HTTPS_PORT, httpPort: HTTP_PORT,
+        hspan: spans.hspan, vspan: spans.vspan, mirrorLive: spans.live === 1, ...extra }));
     };
     const req2 = http.get("http://127.0.0.1:9998/v3/paths/list", { timeout: 1500 }, (r2) => {
       let body = "";

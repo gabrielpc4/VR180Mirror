@@ -266,15 +266,43 @@ $("enter-vr").addEventListener("click", async () => {
   const refSpace = await xrSession.requestReferenceSpace("local");
   const mediaBinding = new XRMediaBinding(xrSession);
 
-  // VR180: stereo left-right halves, 180 deg horizontal, full vertical
-  const layer = mediaBinding.createEquirectLayer(video, {
-    space: refSpace,
-    layout: "stereo-left-right",
-    centralHorizontalAngle: Math.PI,
-    upperVerticalAngle: Math.PI / 2,
-    lowerVerticalAngle: -Math.PI / 2,
-    radius: 0,           // infinite-ish dome
-  });
+  // The stream's angular coverage: full 180 classic, or the FOV-fit span
+  // published by the PC (packs the whole canvas with rendered pixels).
+  async function fetchSpans() {
+    try {
+      const i = await (await fetch(new URL("/info", location.href))).json();
+      if (i.hspan > 10 && i.vspan > 10) {
+        return { h: i.hspan * Math.PI / 180, v: i.vspan * Math.PI / 180 };
+      }
+    } catch (e) {}
+    return { h: Math.PI, v: Math.PI };
+  }
+  let spans = await fetchSpans();
+
+  function makeLayer() {
+    return mediaBinding.createEquirectLayer(video, {
+      space: refSpace,
+      layout: "stereo-left-right",
+      centralHorizontalAngle: spans.h,
+      upperVerticalAngle: spans.v / 2,
+      lowerVerticalAngle: -spans.v / 2,
+      radius: 0,           // infinite-ish dome
+    });
+  }
+  let layer = makeLayer();
+
+  // the span changes when the mirror switches between grid (180) and a live
+  // game (FOV-fit) - re-check periodically and rebuild the layer to match
+  const spanPoll = setInterval(async () => {
+    if (!xrSession) { clearInterval(spanPoll); return; }
+    const s = await fetchSpans();
+    if (Math.abs(s.h - spans.h) > 0.02 || Math.abs(s.v - spans.v) > 0.02) {
+      spans = s;
+      try { layer.destroy(); } catch (e) {}
+      layer = makeLayer();
+      xrSession.updateRenderState({ layers: [layer, projLayer] });
+    }
+  }, 5000);
 
   // A tiny WebGL layer is still required as the session's base render state
   // on some runtimes; give it a transparent projection layer under the media.

@@ -14,10 +14,9 @@
 param(
     [switch]$TestGrid,
     [switch]$NoOBS,
-    # h264 (default): 3840x1920@72 - hardware-decoded reliably by the Quest
-    # browser's WebRTC path (its AV1 WebRTC decode proved to be software-only:
-    # full bitrate arrived but rendered <1fps at 6144x3072). av1: 6144x3072@72,
-    # experimental - only if the viewer page's decoder badge says hardware.
+    # hevc (default): 4096x2048@72 FOV-fit, hardware MSE decode via the page's
+    # buffered mode (~2-4s). h264: 3840x1920@72 low-latency WebRTC (~0.4s).
+    # av1: alternative to hevc for the buffered path.
     [ValidateSet("av1", "h264", "hevc")]
     [string]$Codec = "hevc",
     # target bitrate in kbps (also the floor when -MaxBitrate is set).
@@ -27,7 +26,9 @@ param(
     # the two; omitted = constant bitrate at -Bitrate
     [int]$MaxBitrate = 0,
     # skip the bandwidth monitor window
-    [switch]$NoMonitor
+    [switch]$NoMonitor,
+    # classic full-180 canvas (needed for DeoVR; default is FOV-fit = sharper)
+    [switch]$VR180
 )
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
@@ -42,10 +43,10 @@ function Test-OurObs {
 }
 
 $fps = 72
-# av1: 6144x3072@72 = 1.36 Gpx/s, ~68% of the Quest 3 decoder's rated 8K60 budget
-# h264: Meta browser caps H.264 at 4K; 3840x1920@72 is also the level 5.2 ceiling
-if ($Codec -eq "av1")      { $canvasW = 6144; $canvasH = 3072; $encoderId = "obs_nvenc_av1_tex";  $defBitrate = 150000 }
-elseif ($Codec -eq "hevc") { $canvasW = 6144; $canvasH = 3072; $encoderId = "obs_nvenc_hevc_tex"; $defBitrate = 150000 }
+# 4096-wide is the XR media layer's reliable fast-path size on Quest; FOV-fit
+# packs the game's ~110 degrees into it (~94% of panel-native detail).
+if ($Codec -eq "av1")      { $canvasW = 4096; $canvasH = 2048; $encoderId = "obs_nvenc_av1_tex";  $defBitrate = 150000 }
+elseif ($Codec -eq "hevc") { $canvasW = 4096; $canvasH = 2048; $encoderId = "obs_nvenc_hevc_tex"; $defBitrate = 150000 }
 else                  { $canvasW = 3840; $canvasH = 1920; $encoderId = "obs_nvenc_h264_tex"; $defBitrate = 100000 }
 if ($Bitrate -le 0) { $Bitrate = $defBitrate }
 
@@ -168,6 +169,7 @@ if (Get-OurProcess "VR180Mirror.exe" "VR180Mirror") {
     Write-Host "VR180Mirror already running"
 } else {
     $mirrorArgs = @("--size","${canvasW}x${canvasH}","--fps","$fps","--preview","1280")
+    if ($VR180) { $mirrorArgs += "--vr180" }
     if ($TestGrid) { $mirrorArgs += "--test-grid" }
     Start-Process -FilePath "$root\bin\VR180Mirror.exe" -ArgumentList $mirrorArgs `
         -WorkingDirectory "$root\bin"
