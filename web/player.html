@@ -112,14 +112,37 @@ video.addEventListener("playing", () => {
 // (hardware) -> GPU-backed VideoFrames -> the dome texture. The muted-audio
 // clock of the element still drives A/V sync.
 const wc = {
-  active: false, decoder: null, mp4: null, offset: 0,
-  queue: [], displayed: null, outPerSec: 0, _outCount: 0,
+  active: false, decoder: null, mp4: null, offset: 0, cfg: null,
+  queue: [], pending: [], displayed: null, outPerSec: 0, _outCount: 0,
   reset() {
     try { if (this.decoder && this.decoder.state !== "closed") this.decoder.close(); } catch (e) {}
     for (const f of this.queue) { try { f.close(); } catch (e) {} }
     if (this.displayed) { try { this.displayed.close(); } catch (e) {} }
-    this.active = false; this.decoder = null; this.mp4 = null;
-    this.offset = 0; this.queue = []; this.displayed = null;
+    this.active = false; this.decoder = null; this.mp4 = null; this.cfg = null;
+    this.offset = 0; this.queue = []; this.pending = []; this.displayed = null;
+  },
+  // Just-in-time decode pacing: segments arrive as ~1s bursts of encoded
+  // samples; decoding them all at once would either flood or starve the
+  // shallow VideoFrame queue. Decode only up to clock + 0.35s each tick.
+  pump(clockSec) {
+    if (!this.decoder || this.decoder.state !== "configured") return;
+    // overflow guard (e.g. viewer paused): drop old GOPs up to a keyframe
+    if (this.pending.length > 900) {
+      let k = -1;
+      for (let i = this.pending.length - 600; i > 0; i--) {
+        if (this.pending[i] && this.pending[i].key) { k = i; break; }
+      }
+      if (k > 0) {
+        this.pending.splice(0, k);
+        try { this.decoder.reset(); this.decoder.configure(this.cfg); } catch (e) {}
+      }
+    }
+    while (this.pending.length &&
+           this.pending[0].ts / 1e6 <= clockSec + 0.35 &&
+           this.decoder.decodeQueueSize < 8 && this.queue.length < 8) {
+      const p = this.pending.shift();
+      try { this.decoder.decode(p.chunk); } catch (e) { window.__wcErr = "decode: " + e.message; }
+    }
   },
   feed(chunk) {                       // Uint8Array fMP4 bytes from hls.js
     if (!window.VideoDecoder || !window.MP4Box) return;
@@ -152,6 +175,7 @@ const wc = {
         });
         const cfg = { codec: tr.codec, optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" };
         if (desc) cfg.description = desc;
+        this.cfg = cfg;
         try {
           this.decoder.configure(cfg);
           this.active = true;
@@ -160,16 +184,17 @@ const wc = {
         this.mp4.start();
       };
       this.mp4.onSamples = (id, user, samples) => {
-        if (!this.decoder || this.decoder.state !== "configured") return;
         for (const s of samples) {
-          try {
-            this.decoder.decode(new EncodedVideoChunk({
+          const ts = Math.round(s.cts * 1e6 / s.timescale);
+          this.pending.push({
+            ts, key: !!s.is_sync,
+            chunk: new EncodedVideoChunk({
               type: s.is_sync ? "key" : "delta",
-              timestamp: Math.round(s.cts * 1e6 / s.timescale),
+              timestamp: ts,
               duration: Math.round(s.duration * 1e6 / s.timescale),
               data: s.data,
-            }));
-          } catch (e) { window.__wcErr = "decode: " + e.message; }
+            }),
+          });
         }
       };
     }
@@ -196,7 +221,10 @@ const wc = {
     return f;
   },
 };
-setInterval(() => { wc.outPerSec = wc._outCount * 2; wc._outCount = 0; }, 500);
+setInterval(() => {
+  wc.outPerSec = wc._outCount * 2; wc._outCount = 0;
+  if (wc.active) wc.pump(video.currentTime);   // backup pump outside XR
+}, 500);
 
 // ------------------------------------------------------------- buffered (MSE)
 // hls.js -> MSE -> the browser's hardware video pipeline (the path Meta
@@ -525,7 +553,7 @@ async function runGlDome() {
     hctx.fillRect(0, 0, hudW, hudH);
     hctx.fillStyle = "#3ec3dc";
     hctx.font = "bold 44px monospace";
-    const vsrc = wc.active ? `dec ${wc.outPerSec}fps (WC)` : `video ${live.vidFps}fps`;
+    const vsrc = wc.active ? `dec ${wc.outPerSec}fps q${wc.queue.length}+${wc.pending.length}` : `video ${live.vidFps}fps`;
     hctx.fillText(`XR ${live.xrFps}fps  ${vsrc}  drop ${live.dropPs}/s  buf ${live.buf.toFixed(1)}s`, 18, 62);
     hctx.fillStyle = "#e2eaf1";
     hctx.fillText(`HMD ${d.fps ?? "-"}/${d.maxFps ?? "-"}fps stale ${d.stale ?? "-"}  GPU ${d.gpuBusy ?? "-"}% ${d.gpuMHz ?? "-"}MHz`, 18, 118);
@@ -567,6 +595,7 @@ async function runGlDome() {
     // one video upload shared by both eyes: prefer the WebCodecs sideband
     // (GPU VideoFrames), fall back to the element (broken-ish on Quest)
     if (wc.active) {
+      wc.pump(video.currentTime);
       const f = wc.pick(video.currentTime);
       if (f) {
         gl.bindTexture(gl.TEXTURE_2D, videoTex);
