@@ -245,6 +245,13 @@ public class MainActivity extends Activity {
                 + "&muted=" + (mutedBox.isChecked() ? 1 : 0)
                 + "&fullpic=" + (fullpicBox.isChecked() ? 1 : 0)
                 + "&delay=" + (delayBox.isChecked() ? 1 : 0);
-        startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+            statusDetail.setText("Browser opened: " + url + "  (if you don't see it, check the dock/taskbar for the Browser panel)");
+            // yield our panel focus so the shell brings the browser forward
+            moveTaskToBack(true);
+        } catch (Exception e) {
+            statusDetail.setText("Could not open the browser - open it from the dock and enter: " + url);
+        }
     }
 }
