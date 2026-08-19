@@ -495,7 +495,15 @@ async function runGlDome() {
     "attribute vec3 aPos; attribute vec2 aUV; uniform mat4 uMvp; varying vec2 vUV;" +
     "void main(){ vUV = aUV; gl_Position = uMvp * vec4(aPos, 1.0); }"));
   gl.attachShader(prog, compile(gl.FRAGMENT_SHADER,
-    "precision mediump float; varying vec2 vUV; uniform sampler2D uTex;" +
+    // highp, not mediump: the UV math below (uUvOff + vUV*uUvScale) addresses
+    // individual texels of a 6144px-wide texture. mediump's quantization step
+    // is far coarser than one texel, so the computed UV snapped between
+    // texels wherever the dome allocates many screen pixels per tiny bit of
+    // source content - which is exactly the center of a FOV-fit view (highest
+    // angular resolution on screen). The periphery needs much coarser UV
+    // steps per pixel, so the same absolute error there was never visible.
+    // highp is universally supported for fragment shaders on Quest's GPU.
+    "precision highp float; varying vec2 vUV; uniform sampler2D uTex;" +
     "uniform vec2 uUvOff; uniform vec2 uUvScale; uniform float uAlpha;" +
     "void main(){ vec4 c = texture2D(uTex, uUvOff + vUV * uUvScale);" +
     "gl_FragColor = vec4(c.rgb, c.a * uAlpha); }"));
@@ -559,16 +567,29 @@ async function runGlDome() {
       -w/2, y + h/2, z, 0, 0,   w/2, y + h/2, z, 1, 0,
     ]), gl.STATIC_DRAW);
   }
-  const mkTex = () => {
+  // The compositor's lens pre-warp packs more source pixels per screen pixel
+  // near the center of the frame than near the edges (barrel distortion pushes
+  // periphery content outward) - so the video texture is minified in the
+  // center and magnified at the edges. Plain LINEAR only handles magnification
+  // cleanly; minification without mipmaps aliases instead of averaging down,
+  // which read as a sharp/noisy center next to a smooth border. Trilinear
+  // mipmapping (+ anisotropic, where supported - the dome's minification isn't
+  // uniform in both axes) fixes the center without touching the border.
+  const aniso = gl.getExtension("EXT_texture_filter_anisotropic")
+    || gl.getExtension("MOZ_EXT_texture_filter_anisotropic")
+    || gl.getExtension("WEBKIT_EXT_texture_filter_anisotropic");
+  const maxAniso = aniso ? gl.getParameter(aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT) : 0;
+  const mkTex = (mipmapped) => {
     const t = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, t);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mipmapped ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    if (mipmapped && aniso) gl.texParameterf(gl.TEXTURE_2D, aniso.TEXTURE_MAX_ANISOTROPY_EXT, maxAniso);
     return t;
   };
-  const videoTex = mkTex(), hudTex = mkTex();
+  const videoTex = mkTex(true), hudTex = mkTex(false);
   // Pre-allocate the video texture so each frame is a texSubImage2D update
   // instead of a full re-specification (which reallocates GPU storage).
   let texW = 0, texH = 0;
@@ -579,6 +600,7 @@ async function runGlDome() {
       texW = w; texH = h;
     }
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, src);
+    gl.generateMipmap(gl.TEXTURE_2D);
   }
 
   // rolling metrics + HUD repaint
