@@ -245,6 +245,17 @@ Ports used (all loopback-only, reached via the adb-reverse USB tunnel): 9080 (we
 .\tools\build-console.ps1  # rebuilds tools\VR180Console.exe (in-box csc.exe, no SDK needed)
 ```
 
+## Considering a native OpenXR client
+
+The current spectator viewer runs as a WebXR page in the Quest's browser
+(`web/player.html`). It works, but the browser's own WebXR implementation
+imposes a resolution ceiling well below the panel's real capability (measured
+at exactly 1.5x a reported "1.0x" baseline on one headset - see
+`docs/OPENXR-MIGRATION-NOTES.md`). That doc records every quirk, bug, and
+measurement this project already paid to learn - the shader precision bug,
+video-texture mipmapping, decode-pipeline memory traps, and more - so a future
+native rewrite doesn't have to re-discover any of them from scratch.
+
 ## How it came to be / design notes
 
 - Studied the local **VRto3D** clone (SteamVR virtual-HMD driver): confirmed the direct-mode frame
