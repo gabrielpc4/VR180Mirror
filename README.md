@@ -118,7 +118,8 @@ the dome is world-fixed and the spectator can look around the 180° canvas freel
 | OBS profile+collection `VR180Mirror` | templates in `obs\`, synced to `%APPDATA%\obs-studio` by the launcher | Game Capture of that window → NVENC AV1 6144×3072@72 CBR 150 Mbps → WHIP |
 | `tools\mediamtx\` | MediaMTX v1.20.0 | WebRTC server: WHIP ingest :9889, WHEP out, LL-HLS out :9888, media UDP+TCP :9189 (TCP = USB tunnel), local API :9998 |
 | `web\server.js` | Node | HTTPS :8443 serves the WebXR player + proxies WHEP (single cert acceptance); HTTP :9080 serves the DeoVR JSON |
-| `web\player.html` | | WHEP WebRTC client + WebXR viewer using `XRMediaBinding.createEquirectLayer` (`stereo-left-right`, 180°) — the Quest-accelerated zero-copy video path |
+| `web\player.html` | | WHEP WebRTC client + WebXR viewer. In VR it renders the dome itself in WebGL and gets frames from `wcworker.js` — the Quest browser's video→GL path serves stale frames (measured: 0.7 distinct frames/s while the element "presents" 72), which is why `XRMediaBinding` and plain `<video>` textures both stuttered |
+| `web\wcworker.js` | | Decode worker: fetches the video-only LL-HLS rendition, demuxes (mp4box), hardware-decodes (WebCodecs `VideoDecoder`), posts GPU `VideoFrame`s. Credit-based flow control keeps only ~3 frames (12.6MB each) in flight. Verified in-headset: 72 fps, p99 frame interval 14.8ms, 0 discards, ~0.8s latency |
 
 Ports (chosen to coexist with other streaming stacks): 8443, 9080, 9888, 9889/TCP, 9189/UDP.
 
@@ -138,6 +139,11 @@ Ports (chosen to coexist with other streaming stacks): 8443, 9080, 9888, 9889/TC
 - **Prefer delaying over skipping**: viewer-side checkbox (page + Quest app). Raises the WebRTC
   jitter-buffer target to ~1.5 s so every frame plays at a constant 72 fps — hiccups become
   latency, never dropped frames (the USB path's TCP transport is already lossless).
+- **Stats HUD in VR** (checkbox, on by default): a head-locked panel at the centre of view showing
+  our own pipeline — `XR fps`, `shown`, `dec`, `disc` (discarded for rate matching), `held` (XR
+  frames with no new frame), queue depths — plus the headset's own telemetry pulled over adb
+  (`/devstats`: compositor fps, stale frames, GPU busy %, clocks, temperature) and the latency
+  estimate. Use it to tell a *delivery* problem from a *decode* or *compositor* problem.
 - **Bandwidth monitor** (optional): `tools\BandwidthMonitor.exe` opens with the launcher — live
   delivered-vs-configured bitrate, per-viewer USB/LAN detection, NIC headroom, 2-minute graph.
   Close it anytime or start with `-NoMonitor`. Rebuild: `tools\build-monitor.ps1` (built-in
