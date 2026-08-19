@@ -147,9 +147,40 @@ function settings(req, res) {
   res.end(JSON.stringify(cur));
 }
 
+// ---- LL-HLS proxy ---------------------------------------------------------------
+// Serves MediaMTX's HLS under our own origin (/hls/*), so the buffered player
+// works over the USB localhost tunnel and never trips mixed-content on https.
+function proxyHls(req, res, pathname, search) {
+  const sub = pathname.replace(/^\/hls\/?/, "") || "index.m3u8";
+  const preq = http.request(
+    // keep the query string: LL-HLS uses _HLS_msn/_HLS_part blocking requests
+    {
+      hostname: "127.0.0.1", port: 9888,
+      path: `/${STREAM_PATH}/${sub}${search || ""}`, method: "GET",
+      headers: req.headers.cookie ? { Cookie: req.headers.cookie } : {},
+    },
+    (pres) => {
+      // MediaMTX 302s once for its cookie check; rewrite Location to our mount
+      const headers = {
+        "Content-Type": pres.headers["content-type"] || "application/octet-stream",
+        "Cache-Control": "no-store",
+      };
+      if (pres.headers["location"]) {
+        headers["Location"] = pres.headers["location"].replace(`/${STREAM_PATH}/`, "/hls/");
+      }
+      if (pres.headers["set-cookie"]) headers["Set-Cookie"] = pres.headers["set-cookie"];
+      res.writeHead(pres.statusCode, headers);
+      pres.pipe(res);
+    }
+  );
+  preq.on("error", () => { res.writeHead(502); res.end("HLS upstream unreachable"); });
+  preq.end();
+}
+
 function handler(req, res) {
   const u = new URL(req.url, "http://x");
   if (u.pathname === "/whep" || u.pathname.startsWith("/whep-res/")) return proxyWhep(req, res);
+  if (u.pathname.startsWith("/hls")) return proxyHls(req, res, u.pathname, u.search);
   if (u.pathname === "/settings") return settings(req, res);
   if (u.pathname === "/deovr" || u.pathname === "/deovr.json") return deovr(req, res);
   if (u.pathname === "/info") {

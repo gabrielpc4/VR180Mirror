@@ -18,7 +18,10 @@ api: true
 apiAddress: 127.0.0.1:9998
 rtsp: false
 rtmp: false
-srt: false
+# SRT ingest from OBS: reliable on loopback (recovers lost packets), unlike
+# WHIP's plain UDP which dropped RTP under 150 Mbps keyframe bursts
+srt: true
+srtAddress: :9890
 moq: false
 playback: false
 metrics: false
@@ -37,7 +40,7 @@ webrtcLocalTCPAddress: :9189
 # Advertise loopback (for local OBS publisher) + the LAN IP (for the Quest).
 # Start-Spectator.ps1 rewrites the LAN entry to the current address on launch.
 webrtcIPsFromInterfaces: false
-webrtcAdditionalHosts: [127.0.0.1, 192.168.15.136]
+webrtcAdditionalHosts: [127.0.0.1, 192.168.15.37]
 
 hls: true
 hlsAddress: :9888

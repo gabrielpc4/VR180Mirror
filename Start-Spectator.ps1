@@ -18,8 +18,8 @@ param(
     # browser's WebRTC path (its AV1 WebRTC decode proved to be software-only:
     # full bitrate arrived but rendered <1fps at 6144x3072). av1: 6144x3072@72,
     # experimental - only if the viewer page's decoder badge says hardware.
-    [ValidateSet("av1", "h264")]
-    [string]$Codec = "h264",
+    [ValidateSet("av1", "h264", "hevc")]
+    [string]$Codec = "hevc",
     # target bitrate in kbps (also the floor when -MaxBitrate is set).
     # 0 = codec default (av1: 150000, h264: 80000)
     [int]$Bitrate = 0,
@@ -32,10 +32,20 @@ param(
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 
+# Our OBS may run elevated (scheduled task) - its command line is invisible to
+# non-admin WMI, so check the task state first.
+function Test-OurObs {
+    $t = Get-ScheduledTask -TaskName "VR180Mirror OBS" -ErrorAction SilentlyContinue
+    if ($t -and $t.State -eq "Running") { return $true }
+    return [bool](Get-CimInstance Win32_Process -Filter "Name = 'obs64.exe'" |
+        Where-Object { $_.CommandLine -like "*--profile VR180Mirror*" })
+}
+
 $fps = 72
 # av1: 6144x3072@72 = 1.36 Gpx/s, ~68% of the Quest 3 decoder's rated 8K60 budget
 # h264: Meta browser caps H.264 at 4K; 3840x1920@72 is also the level 5.2 ceiling
-if ($Codec -eq "av1") { $canvasW = 6144; $canvasH = 3072; $encoderId = "obs_nvenc_av1_tex"; $defBitrate = 150000 }
+if ($Codec -eq "av1")      { $canvasW = 6144; $canvasH = 3072; $encoderId = "obs_nvenc_av1_tex";  $defBitrate = 150000 }
+elseif ($Codec -eq "hevc") { $canvasW = 6144; $canvasH = 3072; $encoderId = "obs_nvenc_hevc_tex"; $defBitrate = 150000 }
 else                  { $canvasW = 3840; $canvasH = 1920; $encoderId = "obs_nvenc_h264_tex"; $defBitrate = 100000 }
 if ($Bitrate -le 0) { $Bitrate = $defBitrate }
 
@@ -58,9 +68,7 @@ if (-not (Test-Path "$root\tools\mediamtx\mediamtx.exe")) {
     Write-Host "MediaMTX $($rel.tag_name) installed."
 }
 # ---- sync OBS config to the chosen codec/canvas (skipped while our OBS runs) ----
-$ourObs = Get-CimInstance Win32_Process -Filter "Name = 'obs64.exe'" |
-    Where-Object { $_.CommandLine -like "*--profile VR180Mirror*" }
-if (-not $ourObs) {
+if (-not (Test-OurObs)) {
     $profDir = "$env:APPDATA\obs-studio\basic\profiles\VR180Mirror"
     New-Item -ItemType Directory -Force $profDir | Out-Null
     $utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -168,17 +176,23 @@ if (Get-OurProcess "VR180Mirror.exe" "VR180Mirror") {
 
 # ---- OBS --------------------------------------------------------------------------
 if (-not $NoOBS) {
-    $obsRunning = Get-CimInstance Win32_Process -Filter "Name = 'obs64.exe'" |
-        Where-Object { $_.CommandLine -like "*VR180Mirror*" }
-    if ($obsRunning) {
+    if (Test-OurObs) {
         Write-Host "OBS (VR180Mirror profile) already running"
     } else {
-        Start-Process -FilePath "C:\Program Files\obs-studio\bin\64bit\obs64.exe" `
-            -WorkingDirectory "C:\Program Files\obs-studio\bin\64bit" `
-            -ArgumentList "--multi","--only-bundled-plugins","--disable-shutdown-check","--disable-updater",
-                          "--profile","VR180Mirror","--collection","VR180Mirror",
-                          "--startstreaming","--minimize-to-tray"
-        Write-Host "OBS started (profile VR180Mirror, streaming to WHIP)"
+        # Prefer the elevated scheduled task: higher GPU scheduling priority so
+        # OBS keeps 72fps while the game saturates the GPU.
+        if (Get-ScheduledTask -TaskName "VR180Mirror OBS" -ErrorAction SilentlyContinue) {
+            Start-ScheduledTask -TaskName "VR180Mirror OBS"
+            Write-Host "OBS started elevated via scheduled task (GPU-priority boost)"
+        } else {
+            Write-Host "TIP: run Setup-OBSTask.ps1 once (UAC) so OBS gets GPU priority while gaming." -ForegroundColor Yellow
+            Start-Process -FilePath "C:\Program Files\obs-studio\bin\64bit\obs64.exe" `
+                -WorkingDirectory "C:\Program Files\obs-studio\bin\64bit" `
+                -ArgumentList "--multi","--only-bundled-plugins","--disable-shutdown-check","--disable-updater",
+                              "--profile","VR180Mirror","--collection","VR180Mirror",
+                              "--startstreaming","--minimize-to-tray"
+            Write-Host "OBS started (profile VR180Mirror)"
+        }
     }
 }
 
@@ -195,15 +209,20 @@ if (-not $NoOBS) {
     }
     if (-not $publishing) {
         Write-Host "Ingest silent - restarting OBS stream..." -ForegroundColor Yellow
+        try { Stop-ScheduledTask -TaskName "VR180Mirror OBS" -ErrorAction SilentlyContinue } catch {}
         Get-CimInstance Win32_Process -Filter "Name = 'obs64.exe'" |
             Where-Object { $_.CommandLine -like "*--profile VR180Mirror*" } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -Confirm:$false }
+            ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -Confirm:$false -ErrorAction Stop } catch {} }
         Start-Sleep -Seconds 3
-        Start-Process -FilePath "C:\Program Files\obs-studio\bin\64bit\obs64.exe" `
-            -WorkingDirectory "C:\Program Files\obs-studio\bin\64bit" `
-            -ArgumentList "--multi","--only-bundled-plugins","--disable-shutdown-check","--disable-updater",
-                          "--profile","VR180Mirror","--collection","VR180Mirror",
-                          "--startstreaming","--minimize-to-tray"
+        if (Get-ScheduledTask -TaskName "VR180Mirror OBS" -ErrorAction SilentlyContinue) {
+            Start-ScheduledTask -TaskName "VR180Mirror OBS"
+        } else {
+            Start-Process -FilePath "C:\Program Files\obs-studio\bin\64bit\obs64.exe" `
+                -WorkingDirectory "C:\Program Files\obs-studio\bin\64bit" `
+                -ArgumentList "--multi","--only-bundled-plugins","--disable-shutdown-check","--disable-updater",
+                              "--profile","VR180Mirror","--collection","VR180Mirror",
+                              "--startstreaming","--minimize-to-tray"
+        }
     }
 }
 

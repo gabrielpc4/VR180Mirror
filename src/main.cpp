@@ -545,6 +545,20 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
+// Raise our GPU scheduling priority so the reprojection isn't starved when the
+// game saturates the GPU. (D3DKMT high priority; fails silently if unavailable.)
+static void setGpuPriority() {
+    typedef LONG(WINAPI* Fn)(int);
+    HMODULE gdi = LoadLibraryW(L"gdi32.dll");
+    if (!gdi) return;
+    Fn fn = (Fn)GetProcAddress(gdi, "D3DKMTSetProcessSchedulingPriorityClass");
+    if (fn) {
+        // 4 = D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH
+        LONG r = fn(4);
+        logf("GPU scheduling priority: %s", r == 0 ? "HIGH" : "default (boost unavailable)");
+    }
+}
+
 static void setDpiAware() {
     HMODULE u32 = GetModuleHandleW(L"user32.dll");
     if (!u32) return;
@@ -579,6 +593,8 @@ int main(int argc, char** argv) {
     g_cfg.fps    = std::clamp(g_cfg.fps, 10, 144);
 
     setDpiAware();
+    setGpuPriority();
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
     timeBeginPeriod(1);
 
     logf("VR180Mirror starting: %dx%d @ %d fps (SBS half 180 equirect)",

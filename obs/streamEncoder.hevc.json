@@ -1,0 +1,1 @@
+{"rate_control":"CBR","bitrate":150000,"keyint_sec":1,"preset":"p1","preset2":"p1","tune":"ull","multipass":"disabled","lookahead":false,"psycho_aq":false,"bf":0,"repeat_headers":true,"profile":"main","split_encode":"auto"}

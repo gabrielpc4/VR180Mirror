@@ -52,6 +52,11 @@
   </div>
 
   <div class="row">
+    <label class="chk"><input type="radio" name="mode" id="mode-buf" checked> Max resolution (buffered ~2-4s)</label>
+    <label class="chk"><input type="radio" name="mode" id="mode-rtc"> Low latency (WebRTC, H264 only)</label>
+  </div>
+
+  <div class="row">
     <button id="enter-vr" disabled>🥽 Enter VR (180° immersive)</button>
     <label class="chk"><input type="checkbox" id="headlock"> Hard-lock to player's view (no free look)</label>
     <label class="chk"><input type="checkbox" id="muted" checked> Muted</label>
@@ -62,6 +67,7 @@
   <div id="stats"></div>
   <div id="cap" style="color:#6f757d;font-size:.8rem"></div>
 
+<script src="hls.min.js"></script>
 <script>
 "use strict";
 
@@ -71,11 +77,56 @@ const statusEl = $("status");
 const status2El = $("status2");
 
 let pc = null;
+let hls = null;
 let whepLocation = null;
 let xrSession = null;
 let connected = false;
+let fallbackTimer = null;
 
 function setStatus(t) { statusEl.textContent = t; status2El.textContent = t; }
+
+function teardownTransports() {
+  if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
+  if (pc) { try { pc.close(); } catch (e) {} pc = null; }
+  if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
+  video.srcObject = null;
+  video.removeAttribute("src");
+}
+
+// universal "we have frames" signal for both transports
+video.addEventListener("playing", () => {
+  connected = true;
+  $("dot").classList.add("live");
+  $("overlay").classList.add("hidden");
+  updateVRButton();
+});
+
+// ------------------------------------------------------------- buffered (MSE)
+// hls.js -> MSE -> the browser's hardware video pipeline (the path Meta
+// documents as 8K-capable for HEVC/AV1) reading MediaMTX LL-HLS via our proxy.
+async function bufferedConnect() {
+  if (!window.Hls || !Hls.isSupported()) {
+    throw new Error("MSE not supported in this browser");
+  }
+  hls = new Hls({
+    lowLatencyMode: true,
+    backBufferLength: 10,
+    maxBufferLength: 12,
+    liveSyncDurationCount: 2,
+    maxLiveSyncPlaybackRate: 1.05,
+  });
+  hls.on(Hls.Events.ERROR, (e, data) => {
+    if (data && data.fatal) {
+      setStatus("Stream error: " + data.details + " — Reconnect to retry");
+      $("connect").textContent = "▶ Reconnect";
+      $("connect").disabled = false;
+      $("overlay").classList.remove("hidden");
+    }
+  });
+  hls.loadSource(new URL("/hls/index.m3u8", location.href).href);
+  hls.attachMedia(video);
+  setStatus("Buffering max-resolution stream…");
+}
 
 // ---------------------------------------------------------------- WHEP client
 async function whepConnect() {
@@ -136,8 +187,25 @@ async function whepConnect() {
 $("connect").addEventListener("click", async () => {
   $("connect").disabled = true;
   setStatus("Connecting…");
+  teardownTransports();
   try {
-    await whepConnect();
+    if ($("mode-rtc").checked) {
+      await whepConnect();
+      // if WebRTC connects but never decodes (unsupported codec / software
+      // decoder), fall back to the buffered hardware path automatically
+      fallbackTimer = setTimeout(async () => {
+        if (!video.videoWidth || video.readyState < 2) {
+          setStatus("WebRTC can't decode this stream — switching to buffered mode…");
+          teardownTransports();
+          $("mode-buf").checked = true;
+          try { await bufferedConnect(); } catch (e) { setStatus("Fallback failed: " + e.message); }
+          video.muted = $("muted").checked;
+          video.play().catch(() => {});
+        }
+      }, 5000);
+    } else {
+      await bufferedConnect();
+    }
     video.muted = $("muted").checked;
     await video.play().catch(() => {});
   } catch (e) {
@@ -145,6 +213,16 @@ $("connect").addEventListener("click", async () => {
     $("connect").disabled = false;
   }
 });
+
+// pick the right default mode for the stream's codec (H264 = WebRTC capable;
+// HEVC/AV1 = buffered hardware path)
+fetch(new URL("/info", location.href)).then((r) => r.json()).then((i) => {
+  const tracks = (i.tracks || []).join(",");
+  const rtcOk = tracks.includes("H264");
+  $("mode-rtc").checked = rtcOk;
+  $("mode-buf").checked = !rtcOk;
+  status2El.textContent = "Stream: " + tracks + (i.ready ? " (live)" : " (waiting)");
+}).catch(() => {});
 
 $("muted").addEventListener("change", () => { video.muted = $("muted").checked; });
 
@@ -248,33 +326,44 @@ $("enter-vr").addEventListener("click", async () => {
 
 // ---------------------------------------------------------------- stats
 setInterval(async () => {
-  if (!pc || pc.connectionState !== "connected") { $("stats").textContent = ""; return; }
-  const st = await pc.getStats();
-  let fps = 0, w = 0, h = 0, kbps = 0;
-  st.forEach((r) => {
-    if (r.type === "inbound-rtp" && r.kind === "video") {
-      fps = r.framesPerSecond || 0;
-      w = r.frameWidth || 0; h = r.frameHeight || 0;
-      if (r._prevBytes !== undefined) {} // n/a
-      kbps = Math.round(((r.bytesReceived - (window._pb || 0)) * 8) / 1000);
-      window._pb = r.bytesReceived;
-    }
-  });
-  $("stats").textContent = `${w}x${h} @ ${fps}fps · ${kbps} kbit/s`;
+  if (pc && pc.connectionState === "connected") {
+    const st = await pc.getStats();
+    let fps = 0, w = 0, h = 0, kbps = 0;
+    st.forEach((r) => {
+      if (r.type === "inbound-rtp" && r.kind === "video") {
+        fps = r.framesPerSecond || 0;
+        w = r.frameWidth || 0; h = r.frameHeight || 0;
+        kbps = Math.round(((r.bytesReceived - (window._pb || 0)) * 8) / 1000);
+        window._pb = r.bytesReceived;
+      }
+    });
+    $("stats").textContent = `WebRTC · ${w}x${h} @ ${fps}fps · ${kbps} kbit/s`;
+  } else if (hls && video.videoWidth) {
+    const q = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
+    $("stats").textContent = `Buffered · ${video.videoWidth}x${video.videoHeight}`
+      + (q ? ` · frames ${q.totalVideoFrames} (dropped ${q.droppedVideoFrames})` : "");
+  } else {
+    $("stats").textContent = "";
+  }
 }, 1000);
 
-// On-device decoder probe: tells the spectator whether this browser hardware-
-// decodes the max-fidelity AV1 stream (Meta recommends the Media Capabilities API).
+// On-device decoder probes (Media Capabilities API): can the buffered path
+// hardware-decode the max-resolution stream on this device?
 (async () => {
   try {
     if (!navigator.mediaCapabilities || !navigator.mediaCapabilities.decodingInfo) return;
-    const r = await navigator.mediaCapabilities.decodingInfo({
-      type: "webrtc",
-      video: { contentType: "video/AV1", width: 6144, height: 3072, framerate: 72, bitrate: 150000000 },
-    });
-    $("cap").textContent = "AV1 6144x3072@72 decode: " + (r.supported
-      ? (r.powerEfficient ? "hardware ✓" : "software only — expect stutter; restart the PC pipeline with -Codec h264")
-      : "not supported — restart the PC pipeline with -Codec h264");
+    const q = async (type, contentType) => {
+      try {
+        const r = await navigator.mediaCapabilities.decodingInfo({
+          type,
+          video: { contentType, width: 6144, height: 3072, framerate: 72, bitrate: 150000000 },
+        });
+        return r.supported ? (r.powerEfficient ? "hardware ✓" : "software (slow)") : "unsupported";
+      } catch (e) { return "unknown"; }
+    };
+    const hevc = await q("media-source", 'video/mp4; codecs="hvc1.1.6.L183.B0"');
+    const av1  = await q("media-source", 'video/mp4; codecs="av01.0.17M.08"');
+    $("cap").textContent = `Buffered 6144x3072@72 decode — HEVC: ${hevc} · AV1: ${av1}`;
   } catch (e) { /* probe unavailable; ignore */ }
 })();
 
