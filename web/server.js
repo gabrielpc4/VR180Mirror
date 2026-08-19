@@ -182,6 +182,11 @@ function handler(req, res) {
   if (u.pathname === "/whep" || u.pathname.startsWith("/whep-res/")) return proxyWhep(req, res);
   if (u.pathname === "/hls" || u.pathname.startsWith("/hls/")) return proxyHls(req, res, u.pathname, u.search);
   if (u.pathname === "/settings") return settings(req, res);
+  if (u.pathname === "/devstats") {
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify(dev));
+    return;
+  }
   if (u.pathname === "/deovr" || u.pathname === "/deovr.json") return deovr(req, res);
   if (u.pathname === "/info") {
     // Enriched status for the Quest launcher app: is the ingest live, which codec.
@@ -225,6 +230,46 @@ function deovr(req, res) {
   };
   res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(j));
+}
+
+// ---- headset telemetry (/devstats) ----------------------------------------------
+// Streams the Quest compositor's VrApi log line (FPS, stale frames, clock levels,
+// temperature) plus GPU busy % over adb, for the in-VR stats HUD.
+const { spawn, execFile } = require("child_process");
+const dev = { fps: null, maxFps: null, stale: null, cpuLvl: null, gpuLvl: null,
+              cpuMHz: null, gpuMHz: null, temp: null, gpuBusy: null, updated: 0 };
+const ADB = (() => {
+  const cands = [
+    path.join(process.env.LOCALAPPDATA || "", "Android", "Sdk", "platform-tools", "adb.exe"),
+    "adb",
+  ];
+  for (const c of cands) { try { if (c === "adb" || fs.existsSync(c)) return c; } catch (e) {} }
+  return null;
+})();
+
+function startVrApiTail() {
+  if (!ADB) return;
+  const p = spawn(ADB, ["logcat", "-s", "VrApi"], { windowsHide: true });
+  p.stdout.on("data", (buf) => {
+    const line = buf.toString();
+    const m = line.match(/FPS=(\d+)\/(\d+).*?Stale=(\d+).*?CPU4\/GPU=(\d+)\/(\d+),(\d+)\/(\d+)MHz.*?Temp=([\d.]+)/);
+    if (m) {
+      dev.fps = +m[1]; dev.maxFps = +m[2]; dev.stale = +m[3];
+      dev.cpuLvl = +m[4]; dev.gpuLvl = +m[5]; dev.cpuMHz = +m[6]; dev.gpuMHz = +m[7];
+      dev.temp = +m[8]; dev.updated = Date.now();
+    }
+  });
+  p.on("exit", () => setTimeout(startVrApiTail, 5000));
+  p.on("error", () => {});
+}
+startVrApiTail();
+if (ADB) {
+  setInterval(() => {
+    execFile(ADB, ["shell", "cat", "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage"],
+      { windowsHide: true, timeout: 1500 }, (err, out) => {
+        if (!err && out) { const n = parseInt(out, 10); if (!isNaN(n)) dev.gpuBusy = n; }
+      });
+  }, 1000);
 }
 
 // ---- start -------------------------------------------------------------------

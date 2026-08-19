@@ -62,6 +62,7 @@
     <label class="chk"><input type="checkbox" id="muted" checked> Muted</label>
     <label class="chk" title="Removes the soft fade at the image border so the full rendered picture is visible. Any rounded corners that remain come from the game itself (pixels behind the lens mask are never rendered)."><input type="checkbox" id="fullpic"> Full picture (no edge softening)</label>
     <label class="chk" title="Buffers ~1.5s so every frame plays at a constant 72fps even through hiccups — frames are delayed, never skipped. Adds latency."><input type="checkbox" id="delaypref"> Prefer delaying over skipping</label>
+    <label class="chk" title="Live diagnostics panel at the center of view in VR: XR fps, video fps, drops, buffer, and the headset's GPU/CPU telemetry."><input type="checkbox" id="hud" checked> Show stats HUD in VR</label>
   </div>
   <div id="status2" style="color:#9aa0a6;font-size:.95rem"></div>
   <div id="stats"></div>
@@ -244,11 +245,36 @@ async function updateVRButton() {
 }
 updateVRButton();
 
+// The stream's angular coverage: full 180 classic, or the FOV-fit span
+// published by the PC (packs the whole canvas with rendered pixels).
+async function fetchSpans() {
+  try {
+    const i = await (await fetch(new URL("/info", location.href))).json();
+    if (i.hspan > 10 && i.vspan > 10) {
+      return { h: i.hspan * Math.PI / 180, v: i.vspan * Math.PI / 180 };
+    }
+  } catch (e) {}
+  return { h: Math.PI, v: Math.PI };
+}
+
+// live metrics shared with the HUD
+const live = { xrFps: 0, vidFps: 0, dropPs: 0, buf: 0, dev: {} };
+setInterval(async () => {
+  try { live.dev = await (await fetch(new URL("/devstats", location.href))).json(); } catch (e) {}
+}, 1000);
+
+function mat4mul(a, b) {           // column-major, out = a*b
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+  }
+  return o;
+}
+
 $("enter-vr").addEventListener("click", async () => {
   if (xrSession) { xrSession.end(); return; }
   try {
     xrSession = await navigator.xr.requestSession("immersive-vr", {
-      requiredFeatures: ["layers"],
       optionalFeatures: ["local-floor"],
     });
   } catch (e) {
@@ -263,94 +289,220 @@ $("enter-vr").addEventListener("click", async () => {
     if (rates.includes(72)) xrSession.updateTargetFrameRate(72).catch(() => {});
   }
 
-  const refSpace = await xrSession.requestReferenceSpace("local");
-  const mediaBinding = new XRMediaBinding(xrSession);
-
-  // The stream's angular coverage: full 180 classic, or the FOV-fit span
-  // published by the PC (packs the whole canvas with rendered pixels).
-  async function fetchSpans() {
-    try {
-      const i = await (await fetch(new URL("/info", location.href))).json();
-      if (i.hspan > 10 && i.vspan > 10) {
-        return { h: i.hspan * Math.PI / 180, v: i.vspan * Math.PI / 180 };
-      }
-    } catch (e) {}
-    return { h: Math.PI, v: Math.PI };
-  }
-  let spans = await fetchSpans();
-
-  function makeLayer() {
-    return mediaBinding.createEquirectLayer(video, {
-      space: refSpace,
-      layout: "stereo-left-right",
-      centralHorizontalAngle: spans.h,
-      upperVerticalAngle: spans.v / 2,
-      lowerVerticalAngle: -spans.v / 2,
-      radius: 0,           // infinite-ish dome
-    });
-  }
-  let layer = makeLayer();
-
-  // the span changes when the mirror switches between grid (180) and a live
-  // game (FOV-fit) - re-check periodically and rebuild the layer to match
-  const spanPoll = setInterval(async () => {
-    if (!xrSession) { clearInterval(spanPoll); return; }
-    const s = await fetchSpans();
-    if (Math.abs(s.h - spans.h) > 0.02 || Math.abs(s.v - spans.v) > 0.02) {
-      spans = s;
-      try { layer.destroy(); } catch (e) {}
-      layer = makeLayer();
-      xrSession.updateRenderState({ layers: [layer, projLayer] });
-    }
-  }, 5000);
-
-  // A tiny WebGL layer is still required as the session's base render state
-  // on some runtimes; give it a transparent projection layer under the media.
-  const canvas = document.createElement("canvas");
-  const gl = canvas.getContext("webgl2", { xrCompatible: true, alpha: true });
-  await gl.makeXRCompatible();
-  const glBinding = new XRWebGLBinding(xrSession, gl);
-  const projLayer = glBinding.createProjectionLayer({ alpha: true });
-  xrSession.updateRenderState({ layers: [layer, projLayer] });
-
-  video.play().catch(() => {});
-
-  const headlock = () => $("headlock").checked;
-  const onFrame = (t, frame) => {
-    xrSession.requestAnimationFrame(onFrame);
-    const pose = frame.getViewerPose(refSpace);
-    // keep the base projection layer transparent
-    if (pose) {
-      for (const view of pose.views) {
-        const sub = glBinding.getViewSubImage(projLayer, view);
-        gl.bindFramebuffer(gl.FRAMEBUFFER, sub.framebuffer);
-        const vp = sub.viewport;
-        gl.viewport(vp.x, vp.y, vp.width, vp.height);
-        gl.clearColor(0, 0, 0, 0);
-        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-      }
-    }
-    // Hard-lock mode: glue the dome to the viewer's head every frame,
-    // so the spectator sees EXACTLY the player's framing at all times.
-    if (pose && headlock()) {
-      layer.transform = new XRRigidTransform(
-        { x: 0, y: 0, z: 0 },
-        pose.transform.orientation
-      );
-    } else if (!headlock() && layer.transform &&
-               (layer.transform.orientation.x !== 0 || layer.transform.orientation.y !== 0 ||
-                layer.transform.orientation.z !== 0 || layer.transform.orientation.w !== 1)) {
-      layer.transform = new XRRigidTransform({ x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 0, w: 1 });
-    }
-  };
-  xrSession.requestAnimationFrame(onFrame);
-
   xrSession.addEventListener("end", () => {
     xrSession = null;
     $("enter-vr").textContent = "🥽 Enter VR (180° immersive)";
     updateVRButton();
   });
+
+  try {
+    await runGlDome();
+  } catch (e) {
+    window.__xrErr = String(e && e.stack || e);
+    setStatus("VR renderer failed: " + e.message);
+    try { xrSession.end(); } catch (e2) {}
+  }
 });
+
+// WebGL dome renderer: draws the video straight into the XR framebuffer each
+// frame (classic XRWebGLLayer). Replaces XRMediaBinding, whose video-frame
+// import path proved broken on Quest (fresh frames decoded at 72 but the
+// layer displayed ~10fps of stale content). Also draws the stats HUD.
+async function runGlDome() {
+  const refSpace = await xrSession.requestReferenceSpace("local");
+  let spans = await fetchSpans();
+
+  const canvas = document.createElement("canvas");
+  const gl = canvas.getContext("webgl2", { xrCompatible: true });
+  await gl.makeXRCompatible();
+  xrSession.updateRenderState({ baseLayer: new XRWebGLLayer(xrSession, gl) });
+
+  const compile = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER,
+    "attribute vec3 aPos; attribute vec2 aUV; uniform mat4 uMvp; varying vec2 vUV;" +
+    "void main(){ vUV = aUV; gl_Position = uMvp * vec4(aPos, 1.0); }"));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER,
+    "precision mediump float; varying vec2 vUV; uniform sampler2D uTex;" +
+    "uniform vec2 uUvOff; uniform vec2 uUvScale; uniform float uAlpha;" +
+    "void main(){ vec4 c = texture2D(uTex, uUvOff + vUV * uUvScale);" +
+    "gl_FragColor = vec4(c.rgb, c.a * uAlpha); }"));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+  const loc = {
+    pos: gl.getAttribLocation(prog, "aPos"),
+    uv: gl.getAttribLocation(prog, "aUV"),
+    mvp: gl.getUniformLocation(prog, "uMvp"),
+    off: gl.getUniformLocation(prog, "uUvOff"),
+    scale: gl.getUniformLocation(prog, "uUvScale"),
+    alpha: gl.getUniformLocation(prog, "uAlpha"),
+  };
+
+  // ---- dome mesh over the stream's angular span (uv v=0 = top row) ----
+  const domeVbo = gl.createBuffer(), domeIbo = gl.createBuffer();
+  let domeCount = 0;
+  function buildDome() {
+    const R = 36, C = 72, rad = 40;
+    const verts = [], idx = [];
+    for (let r = 0; r <= R; r++) {
+      const lat = spans.v * (0.5 - r / R);
+      const cl = Math.cos(lat), sl = Math.sin(lat);
+      for (let c = 0; c <= C; c++) {
+        const lon = spans.h * (c / C - 0.5);
+        verts.push(cl * Math.sin(lon) * rad, sl * rad, -cl * Math.cos(lon) * rad, c / C, r / R);
+      }
+    }
+    for (let r = 0; r < R; r++) for (let c = 0; c < C; c++) {
+      const a = r * (C + 1) + c, b = a + C + 1;
+      idx.push(a, b, a + 1, a + 1, b, b + 1);
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, domeVbo);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, domeIbo);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(idx), gl.STATIC_DRAW);
+    domeCount = idx.length;
+  }
+  buildDome();
+  const spanPoll = setInterval(async () => {
+    if (!xrSession) { clearInterval(spanPoll); return; }
+    const s = await fetchSpans();
+    if (Math.abs(s.h - spans.h) > 0.02 || Math.abs(s.v - spans.v) > 0.02) {
+      spans = s;
+      buildDome();
+    }
+  }, 5000);
+
+  // ---- HUD quad (head-locked, center of view) ----
+  const hudW = 1024, hudH = 192;
+  const hudCanvas = document.createElement("canvas");
+  hudCanvas.width = hudW; hudCanvas.height = hudH;
+  const hctx = hudCanvas.getContext("2d");
+  const hudVbo = gl.createBuffer();
+  {
+    const w = 1.05, h = w * hudH / hudW, z = -1.7, y = -0.02;
+    gl.bindBuffer(gl.ARRAY_BUFFER, hudVbo);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -w/2, y - h/2, z, 0, 1,   w/2, y - h/2, z, 1, 1,
+      -w/2, y + h/2, z, 0, 0,   w/2, y + h/2, z, 1, 0,
+    ]), gl.STATIC_DRAW);
+  }
+  const mkTex = () => {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  };
+  const videoTex = mkTex(), hudTex = mkTex();
+
+  // rolling metrics + HUD repaint
+  let rafCount = 0, lastQ = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
+  const hudTimer = setInterval(() => {
+    if (!xrSession) { clearInterval(hudTimer); return; }
+    live.xrFps = rafCount * 2; rafCount = 0;
+    if (video.getVideoPlaybackQuality) {
+      const q = video.getVideoPlaybackQuality();
+      live.vidFps = (q.totalVideoFrames - lastQ.totalVideoFrames) * 2;
+      live.dropPs = (q.droppedVideoFrames - lastQ.droppedVideoFrames) * 2;
+      lastQ = q;
+    }
+    live.buf = video.buffered.length ? (video.buffered.end(video.buffered.length - 1) - video.currentTime) : 0;
+    const d = live.dev || {};
+    hctx.clearRect(0, 0, hudW, hudH);
+    hctx.fillStyle = "rgba(10,14,20,0.72)";
+    hctx.fillRect(0, 0, hudW, hudH);
+    hctx.fillStyle = "#3ec3dc";
+    hctx.font = "bold 44px monospace";
+    hctx.fillText(`XR ${live.xrFps}fps  video ${live.vidFps}fps  drop ${live.dropPs}/s  buf ${live.buf.toFixed(1)}s`, 18, 62);
+    hctx.fillStyle = "#e2eaf1";
+    hctx.fillText(`HMD ${d.fps ?? "-"}/${d.maxFps ?? "-"}fps stale ${d.stale ?? "-"}  GPU ${d.gpuBusy ?? "-"}% ${d.gpuMHz ?? "-"}MHz`, 18, 118);
+    hctx.fillText(`CPU L${d.cpuLvl ?? "-"} ${d.cpuMHz ?? "-"}MHz  ${d.temp ?? "-"}C  ${video.videoWidth}x${video.videoHeight}`, 18, 174);
+    gl.bindTexture(gl.TEXTURE_2D, hudTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, hudCanvas);
+  }, 500);
+
+  video.play().catch(() => {});
+  const headlock = () => $("headlock").checked;
+  const showHud = () => $("hud").checked;
+
+  const drawBuf = (vbo, ibo, count, mvp, uvOff, uvScale, alpha) => {
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.enableVertexAttribArray(loc.pos);
+    gl.vertexAttribPointer(loc.pos, 3, gl.FLOAT, false, 20, 0);
+    gl.enableVertexAttribArray(loc.uv);
+    gl.vertexAttribPointer(loc.uv, 2, gl.FLOAT, false, 20, 12);
+    gl.uniformMatrix4fv(loc.mvp, false, mvp);
+    gl.uniform2fv(loc.off, uvOff);
+    gl.uniform2fv(loc.scale, uvScale);
+    gl.uniform1f(loc.alpha, alpha);
+    if (ibo) {
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+      gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, 0);
+    } else {
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, count);
+    }
+  };
+
+  const viewNoTrans = new Float32Array(16);
+  const onFrame = (t, frame) => {
+    if (!xrSession) return;
+    xrSession.requestAnimationFrame(onFrame);
+    rafCount++;
+    const pose = frame.getViewerPose(refSpace);
+    if (!pose) return;
+
+    // one video upload shared by both eyes
+    if (video.readyState >= 2) {
+      gl.bindTexture(gl.TEXTURE_2D, videoTex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, video);
+    }
+
+    const glLayer = xrSession.renderState.baseLayer;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, glLayer.framebuffer);
+    gl.disable(gl.DEPTH_TEST);
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.useProgram(prog);
+    gl.activeTexture(gl.TEXTURE0);
+
+    for (const view of pose.views) {
+      const vp = glLayer.getViewport(view);
+      gl.viewport(vp.x, vp.y, vp.width, vp.height);
+      const right = view.eye === "right";
+
+      // dome: world-fixed (rotation-only view) or hard-locked to the head
+      let mvp;
+      if (headlock()) {
+        mvp = view.projectionMatrix;
+      } else {
+        viewNoTrans.set(view.transform.inverse.matrix);
+        viewNoTrans[12] = viewNoTrans[13] = viewNoTrans[14] = 0;
+        mvp = mat4mul(view.projectionMatrix, viewNoTrans);
+      }
+      gl.bindTexture(gl.TEXTURE_2D, videoTex);
+      gl.disable(gl.BLEND);
+      drawBuf(domeVbo, domeIbo, domeCount, mvp, right ? [0.5, 0] : [0, 0], [0.5, 1], 1.0);
+
+      if (showHud()) {
+        gl.bindTexture(gl.TEXTURE_2D, hudTex);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        drawBuf(hudVbo, null, 4, view.projectionMatrix, [0, 0], [1, 1], 0.92);
+        gl.disable(gl.BLEND);
+      }
+    }
+  };
+  xrSession.requestAnimationFrame(onFrame);
+}
 
 // ---------------------------------------------------------------- stats
 setInterval(async () => {
