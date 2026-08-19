@@ -172,7 +172,7 @@ public class ConsoleForm : Form
         var rsLbl = new Label { Text = "Quest render scale", ForeColor = Dim, Left = 10, Top = 90, AutoSize = true, BackColor = Bg };
         renderScaleNud = new NumericUpDown {
             Left = 160, Top = 86, Width = 70, Minimum = 1.00m, Maximum = 2.00m,
-            Increment = 0.01m, DecimalPlaces = 2, Value = 1.60m
+            Increment = 0.01m, DecimalPlaces = 2, Value = 1.50m
         };
         renderScaleNud.ValueChanged += (s, e) => PushRenderScale();
         var rsHint = new Label {

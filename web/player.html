@@ -60,12 +60,12 @@
     <label class="chk"><input type="checkbox" id="headlock"> Hard-lock to player's view (no free look)</label>
     <label class="chk"><input type="checkbox" id="muted" checked> Muted</label>
     <label class="chk" title="Removes the soft fade at the image border so the full rendered picture is visible. Any rounded corners that remain come from the game itself (pixels behind the lens mask are never rendered)."><input type="checkbox" id="fullpic"> Full picture (no edge softening)</label>
-    <label class="chk" title="Live diagnostics panel at the center of view in VR: XR fps, video fps, drops, buffer, and the headset's GPU/CPU telemetry."><input type="checkbox" id="hud" checked> Show stats HUD in VR</label>
+    <label class="chk" title="Live diagnostics panel at the center of view in VR: XR fps, video fps, drops, buffer, and the headset's GPU/CPU telemetry."><input type="checkbox" id="hud"> Show stats HUD in VR</label>
   </div>
   <div class="row">
     <label class="chk" title="Multiplier on top of this headset's own recommended XR framebuffer size. Applied when you press Enter VR; change it and re-enter VR to take effect.">
-      Render scale <input type="range" id="renderscale" min="1.00" max="2.00" step="0.01" value="1.60" style="width:160px;vertical-align:middle">
-      <span id="renderscale-val">1.60x</span>
+      Render scale <input type="range" id="renderscale" min="1.00" max="2.00" step="0.01" value="1.50" style="width:160px;vertical-align:middle">
+      <span id="renderscale-val">1.50x</span>
     </label>
   </div>
   <div id="status2" style="color:#9aa0a6;font-size:.95rem"></div>
@@ -770,7 +770,7 @@ setInterval(async () => {
 // desktop - the goal resolution is a known constant (6144x3264), so the right
 // multiplier only needs to be found once per headset. ?ss= still overrides
 // for a one-off link.
-let RENDER_SCALE = 1.6;
+let RENDER_SCALE = 1.5;
 async function pushRenderScale() {
   try {
     await fetch(new URL("/settings", location.href), {
@@ -789,7 +789,7 @@ async function initRenderScale() {
     if (typeof s.renderScale === "number") fromServer = s.renderScale;
   } catch (e) {}
   RENDER_SCALE = Math.min(2.0, Math.max(1.0,
-    !isNaN(fromUrl) ? fromUrl : (!isNaN(fromServer) ? fromServer : 1.6)));
+    !isNaN(fromUrl) ? fromUrl : (!isNaN(fromServer) ? fromServer : 1.5)));
   slider.value = RENDER_SCALE.toFixed(2);
   label.textContent = RENDER_SCALE.toFixed(2) + "x";
   slider.addEventListener("input", () => {
