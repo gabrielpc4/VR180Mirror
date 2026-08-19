@@ -114,17 +114,33 @@ video.addEventListener("playing", () => {
 const wc = {
   active: false, decoder: null, mp4: null, offset: 0, cfg: null,
   queue: [], pending: [], displayed: null, outPerSec: 0, _outCount: 0,
+  lastAppendTs: null, clockOffset: null,
+  // hls.js re-bases live segments onto the element timeline, while mp4box
+  // reports the muxer's raw timestamps (observed ~2141s apart). Estimate the
+  // offset from (newest appended chunk ts) vs (buffered end) and translate.
+  estimateOffset() {
+    if (this.lastAppendTs == null || !video.buffered.length) return;
+    const est = this.lastAppendTs / 1e6 - video.buffered.end(video.buffered.length - 1);
+    this.clockOffset = this.clockOffset == null ? est : this.clockOffset * 0.7 + est * 0.3;
+  },
+  clock() {
+    if (this.clockOffset != null) return video.currentTime + this.clockOffset;
+    // bootstrap before the first estimate: just start from the queue front
+    return this.pending.length ? this.pending[0].ts / 1e6 + 0.2 : 0;
+  },
   reset() {
     try { if (this.decoder && this.decoder.state !== "closed") this.decoder.close(); } catch (e) {}
     for (const f of this.queue) { try { f.close(); } catch (e) {} }
     if (this.displayed) { try { this.displayed.close(); } catch (e) {} }
     this.active = false; this.decoder = null; this.mp4 = null; this.cfg = null;
     this.offset = 0; this.queue = []; this.pending = []; this.displayed = null;
+    this.lastAppendTs = null; this.clockOffset = null;
   },
   // Just-in-time decode pacing: segments arrive as ~1s bursts of encoded
   // samples; decoding them all at once would either flood or starve the
   // shallow VideoFrame queue. Decode only up to clock + 0.35s each tick.
-  pump(clockSec) {
+  pump() {
+    const clockSec = this.clock();
     if (!this.decoder || this.decoder.state !== "configured") return;
     // overflow guard (e.g. viewer paused): drop old GOPs up to a keyframe
     if (this.pending.length > 900) {
@@ -186,6 +202,7 @@ const wc = {
       this.mp4.onSamples = (id, user, samples) => {
         for (const s of samples) {
           const ts = Math.round(s.cts * 1e6 / s.timescale);
+          if (this.lastAppendTs == null || ts > this.lastAppendTs) this.lastAppendTs = ts;
           this.pending.push({
             ts, key: !!s.is_sync,
             chunk: new EncodedVideoChunk({
@@ -203,9 +220,10 @@ const wc = {
     this.offset += buf.byteLength;
     try { this.mp4.appendBuffer(buf); } catch (e) { window.__wcErr = "append: " + e; }
   },
-  // newest frame not ahead of the element clock (A/V sync); falls back to
+  // newest frame not ahead of the (offset-corrected) clock; falls back to
   // the newest available so startup shows video before the clock settles
-  pick(clockSec) {
+  pick() {
+    const clockSec = this.clock();
     if (!this.queue.length) return null;
     let idx = -1;
     for (let i = 0; i < this.queue.length; i++) {
@@ -223,7 +241,7 @@ const wc = {
 };
 setInterval(() => {
   wc.outPerSec = wc._outCount * 2; wc._outCount = 0;
-  if (wc.active) wc.pump(video.currentTime);   // backup pump outside XR
+  if (wc.active) { wc.estimateOffset(); wc.pump(); }   // backup pump outside XR
 }, 500);
 
 // ------------------------------------------------------------- buffered (MSE)
@@ -595,8 +613,8 @@ async function runGlDome() {
     // one video upload shared by both eyes: prefer the WebCodecs sideband
     // (GPU VideoFrames), fall back to the element (broken-ish on Quest)
     if (wc.active) {
-      wc.pump(video.currentTime);
-      const f = wc.pick(video.currentTime);
+      wc.pump();
+      const f = wc.pick();
       if (f) {
         gl.bindTexture(gl.TEXTURE_2D, videoTex);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, f);
