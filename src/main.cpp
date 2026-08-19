@@ -796,9 +796,8 @@ int main(int argc, char** argv) {
             if (nowTick - lastTick >= 5000) {
                 const long long c = g_presentCount.load(std::memory_order_relaxed);
                 const double rate = (c - lastCount) * 1000.0 / (nowTick - lastTick);
+                // published in mirror_status.json (and /info); not printed
                 g_presentFps.store((int)(rate + 0.5), std::memory_order_relaxed);
-                logf("present rate: %.1f fps (target %d)%s", rate, g_cfg.fps,
-                     g_tearing ? " [tearing]" : "");
                 lastCount = c;
                 lastTick = nowTick;
             }

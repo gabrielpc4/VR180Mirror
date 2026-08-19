@@ -15,4 +15,3 @@ quest-app/build/
 bin/runtime.json
 web/*.log
 tools/mediamtx/*.log
-tools/BandwidthMonitor.exe

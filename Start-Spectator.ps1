@@ -25,8 +25,6 @@ param(
     # optional ceiling in kbps: when > Bitrate, the encoder runs VBR between
     # the two; omitted = constant bitrate at -Bitrate
     [int]$MaxBitrate = 0,
-    # skip the bandwidth monitor window
-    [switch]$NoMonitor,
     # source render rate as a multiple of the stream fps (see below)
     [double]$SourceFpsScale = 1.0,
     # classic full-180 canvas (needed for DeoVR; default is FOV-fit = sharper)
@@ -234,18 +232,6 @@ if (-not $NoOBS) {
                               "--profile","VR180Mirror","--collection","VR180Mirror",
                               "--startstreaming","--minimize-to-tray"
         }
-    }
-}
-
-# ---- bandwidth monitor (optional; close its window or use -NoMonitor) -----------
-if (-not $NoMonitor) {
-    if (-not (Test-Path "$root\tools\BandwidthMonitor.exe")) {
-        try { & "$root\tools\build-monitor.ps1" } catch { Write-Host "monitor build failed: $_" }
-    }
-    if ((Test-Path "$root\tools\BandwidthMonitor.exe") -and
-        -not (Get-CimInstance Win32_Process -Filter "Name = 'BandwidthMonitor.exe'")) {
-        Start-Process "$root\tools\BandwidthMonitor.exe" -WorkingDirectory "$root\tools"
-        Write-Host "Bandwidth monitor opened (close it anytime; -NoMonitor to skip)"
     }
 }
 
