@@ -49,8 +49,13 @@ $fps = 72
 # 3072x3216 per-eye render, so the reprojection resamples as little as possible.
 # (The old 4096 cap came from XRMediaBinding's fast path; we render the dome
 # ourselves now, so that limit no longer applies.)
+# Bitrate is 150 Mbps, not higher, and that is a decoder decision rather than a
+# bandwidth one: the USB tunnel moves a 24MB segment in 0.12s (~1.6 Gbps), but
+# HEVC entropy decoding scales with bits, and at 200-240 Mbps the headset
+# decoder fell behind 72fps - the backlog grew and latency went 0.6s -> 1.7-2.6s.
+# At 150 Mbps it holds 72fps with ~0.6s latency at the same native resolution.
 if ($Codec -eq "av1")      { $canvasW = 4096; $canvasH = 2048; $encoderId = "obs_nvenc_av1_tex";  $defBitrate = 150000 }
-elseif ($Codec -eq "hevc") { $canvasW = 6144; $canvasH = 3072; $encoderId = "obs_nvenc_hevc_tex"; $defBitrate = 240000 }
+elseif ($Codec -eq "hevc") { $canvasW = 6144; $canvasH = 3072; $encoderId = "obs_nvenc_hevc_tex"; $defBitrate = 150000 }
 else                  { $canvasW = 3840; $canvasH = 1920; $encoderId = "obs_nvenc_h264_tex"; $defBitrate = 100000 }
 if ($Bitrate -le 0) { $Bitrate = $defBitrate }
 

@@ -221,6 +221,13 @@ const wc = {
   },
 };
 setInterval(() => {
+  // Watchdog: decoding is credit-paced (one credit per frame consumed or shed),
+  // so an empty queue means no credits, which means no decoding - a deadlock
+  // that shows up as "dec 0/s, held 72/s" with the backlog still growing.
+  // Any starvation while chunks are waiting gets a small top-up.
+  if (wc.active && wc.queue.length === 0 && wc.pendingDepth > 0 && wc.worker) {
+    wc.worker.postMessage({ type: "credit", n: 3 });
+  }
   wc.outPerSec = wc._outCount * 2; wc._outCount = 0;
   wc.dispPerSec = wc._dispCount * 2; wc._dispCount = 0;
   wc.discPerSec = wc._discCount * 2; wc._discCount = 0;
@@ -798,11 +805,13 @@ const DELAY_TARGET_MS = 1500;
 // Framebuffer supersample on top of the native scale. 1.0 = native panel
 // pixels; >1 renders larger and lets the compositor downsample (sharper edges,
 // more fill rate). Overridable with ?ss=1.25 for experiments.
-// 1.6 makes the framebuffer 3072 px per eye - 1:1 with the 6144x3072 stream,
-// so nothing is downsampled at the last step. Measured on Quest 3: p99 frame
-// interval 16.0ms, 0 stale compositor frames, GPU 28%.
+// 1.4 -> 5734x4106, i.e. 2867 px per eye: still 1.39x the panel's 2064, so the
+// stream is not the limit, and it leaves GPU headroom. Measured on Quest 3 over
+// 800 frames: p99 15.3ms, max 18.0ms, 0 frames over 25ms, 0 stale, GPU 25%.
+// 1.6 (3072/eye, 1:1 with the stream) also decodes fine but the XR render then
+// drifts to 66/72 fps at 39% GPU - past the point of diminishing returns.
 const SUPERSAMPLE = Math.min(2.0, Math.max(0.8,
-  parseFloat(new URLSearchParams(location.search).get("ss")) || 1.6));
+  parseFloat(new URLSearchParams(location.search).get("ss")) || 1.4));
 function applyDelayPref() {
   if (!pc) return;
   const target = $("delaypref").checked ? DELAY_TARGET_MS : 0;

@@ -209,7 +209,7 @@ float4 grid(float2 e, bool isRight) {
 
     float2 cell = float2(lonD / 10.0, latD / 10.0);
     float2 g = abs(frac(cell + 0.5) - 0.5) / fwidth(cell);
-    float line10 = 1.0 - saturate(min(g.x, g.y));
+    float line10 = 1.0 - saturate(min(g.x, g.y) * 0.5);
 
     float2 axd = abs(float2(lonD, latD)) / fwidth(float2(lonD, latD));
     float axis = 1.0 - saturate(min(axd.x, axd.y) * 0.5);
@@ -220,7 +220,7 @@ float4 grid(float2 e, bool isRight) {
 
     // 60-degree ring around center to show scale of typical game FOV
     float ang = degrees(acos(clamp(cos(radians(latD)) * cos(radians(lonD)), -1.0, 1.0)));
-    float ring = 1.0 - saturate(abs(ang - 55.0) / (fwidth(ang) * 1.5));
+    float ring = 1.0 - saturate(abs(ang - 55.0) / (fwidth(ang) * 3.0));
     col = lerp(col, float3(0.9, 0.75, 0.2), ring * 0.8);
 
     // sweeping bar: crosses -90..+90 every 4 seconds
