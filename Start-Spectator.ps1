@@ -2,9 +2,13 @@
 # Start-Spectator.ps1 - one-click start for the VR180 spectator pipeline
 #
 #   VR180Mirror.exe  (SteamVR mirror -> VR180 SBS window)
-#     -> OBS (Game Capture -> NVENC H264 -> WHIP)
-#       -> MediaMTX (WebRTC/WHEP + LL-HLS)
-#         -> Quest 2 browser / DeoVR
+#     -> OBS (Game Capture -> NVENC HEVC -> RTMP)
+#       -> MediaMTX (LL-HLS)
+#         -> Quest browser, over USB only (adb reverse tcp:9080)
+#
+# USB cable requirement: this pipeline pushes ~150 Mbps of video over the adb
+# tunnel, so the cable and the PC port both need to be USB 3.0 (a USB 2.0
+# cable/port caps out around 480 Mbps shared and will starve the stream).
 #
 # Usage:
 #   .\Start-Spectator.ps1              normal run
@@ -14,21 +18,27 @@
 param(
     [switch]$TestGrid,
     [switch]$NoOBS,
-    # hevc (default): 4096x2048@72 FOV-fit, hardware MSE decode via the page's
-    # buffered mode (~2-4s). h264: 3840x1920@72 low-latency WebRTC (~0.4s).
-    # av1: alternative to hevc for the buffered path.
+    # hevc (default): 6144x3264@72 native, hardware decode via the page's
+    # buffered WebCodecs path. av1/h264 remain valid OBS encoder choices at
+    # lower canvases if you need to trade resolution for headroom.
     [ValidateSet("av1", "h264", "hevc")]
     [string]$Codec = "hevc",
     # target bitrate in kbps (also the floor when -MaxBitrate is set).
-    # 0 = codec default (av1: 150000, h264: 80000)
+    # 0 = codec default (hevc/av1: 150000, h264: 80000)
     [int]$Bitrate = 0,
     # optional ceiling in kbps: when > Bitrate, the encoder runs VBR between
     # the two; omitted = constant bitrate at -Bitrate
     [int]$MaxBitrate = 0,
     # source render rate as a multiple of the stream fps (see below)
     [double]$SourceFpsScale = 1.0,
-    # classic full-180 canvas (needed for DeoVR; default is FOV-fit = sharper)
-    [switch]$VR180
+    # classic full-180 canvas (default is FOV-fit = sharper)
+    [switch]$VR180,
+    # adb device serial to target when more than one Quest is plugged in over
+    # USB (see `adb devices`); default picks the sole device if only one is attached
+    [string]$Serial = "",
+    # do the setup (OBS config, USB tunnels) but start nothing:
+    # VR180Console.exe owns the processes so it can guarantee they all die with it
+    [switch]$ProvisionOnly
 )
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
@@ -43,10 +53,14 @@ function Test-OurObs {
 }
 
 $fps = 72
-# 6144x3072 is the native target: 3072 px per eye over the game's ~114 deg is
-# ~27 px/deg, past the Quest 3 panel's ~25 PPD, so the display is the limit
-# rather than the stream. It is also ~1:1 with Virtual Desktop Godlike's
-# 3072x3216 per-eye render, so the reprojection resamples as little as possible.
+# 6144x3264 is the native target: per-eye 3072x3264, measured via
+# IVRSystem::GetRecommendedRenderTargetSize() as exactly what SteamVR asks the
+# game to render at with Virtual Desktop's Godlike profile and the SteamVR
+# Video tab at 100% (VR180Mirror.exe logs this on connect: "SteamVR recommended
+# render target: WxH per eye" - re-measure if you change either setting). Using
+# that exact size means our canvas neither crops nor stretches the game's own
+# render before encoding - an earlier guess of 3072 tall (this game's actual
+# per-eye height is 3264) was silently cropping ~6% of vertical resolution.
 # (The old 4096 cap came from XRMediaBinding's fast path; we render the dome
 # ourselves now, so that limit no longer applies.)
 # Bitrate is 150 Mbps, not higher, and that is a decoder decision rather than a
@@ -55,7 +69,7 @@ $fps = 72
 # decoder fell behind 72fps - the backlog grew and latency went 0.6s -> 1.7-2.6s.
 # At 150 Mbps it holds 72fps with ~0.6s latency at the same native resolution.
 if ($Codec -eq "av1")      { $canvasW = 4096; $canvasH = 2048; $encoderId = "obs_nvenc_av1_tex";  $defBitrate = 150000 }
-elseif ($Codec -eq "hevc") { $canvasW = 6144; $canvasH = 3072; $encoderId = "obs_nvenc_hevc_tex"; $defBitrate = 150000 }
+elseif ($Codec -eq "hevc") { $canvasW = 6144; $canvasH = 3264; $encoderId = "obs_nvenc_hevc_tex"; $defBitrate = 150000 }
 else                  { $canvasW = 3840; $canvasH = 1920; $encoderId = "obs_nvenc_h264_tex"; $defBitrate = 100000 }
 if ($Bitrate -le 0) { $Bitrate = $defBitrate }
 
@@ -107,70 +121,73 @@ if (-not (Test-OurObs)) {
     Write-Host "OBS already running - config sync skipped (stop it first to change codec/resolution)"
 }
 
-# ---- LAN IP -----------------------------------------------------------------
-$lanIp = (Get-NetIPAddress -AddressFamily IPv4 |
-    Where-Object { $_.InterfaceAlias -notmatch 'Loopback|vEthernet' -and $_.IPAddress -notmatch '^169\.' -and $_.PrefixOrigin -ne 'WellKnown' } |
-    Sort-Object -Property { $_.InterfaceAlias -notmatch 'Ethernet' } |
-    Select-Object -First 1).IPAddress
-if (-not $lanIp) { throw "No LAN IPv4 address found" }
-Write-Host "LAN IP: $lanIp"
-
-# ---- keep mediamtx advertised host current -----------------------------------
-$yml = "$root\tools\mediamtx\mediamtx.yml"
-$cfg = Get-Content $yml -Raw
-$new = $cfg -replace 'webrtcAdditionalHosts:.*', "webrtcAdditionalHosts: [127.0.0.1, $lanIp]"
-if ($new -ne $cfg) {
-    # BOM-less UTF-8: PS5's -Encoding utf8 writes a BOM, which MediaMTX's YAML parser rejects
-    [IO.File]::WriteAllText($yml, $new, (New-Object System.Text.UTF8Encoding($false)))
-    Write-Host "mediamtx.yml: advertised host -> $lanIp"
-}
-
-# ---- self-signed cert for the WebXR page (once) -------------------------------
-if (-not (Test-Path "$root\web\cert.pem") -or -not (Test-Path "$root\web\key.pem")) {
-    $openssl = "C:\Program Files\Git\usr\bin\openssl.exe"
-    if (-not (Test-Path $openssl)) { $openssl = (Get-Command openssl -ErrorAction Stop).Source }
-    Write-Host "Generating self-signed certificate (web\cert.pem)..."
-    & $openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes `
-        -keyout "$root\web\key.pem" -out "$root\web\cert.pem" `
-        -subj "/CN=VR180Mirror" `
-        -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:$lanIp" | Out-Null
-}
-
-# ---- firewall (one-time, needs a UAC confirmation) ----------------------------
-if (-not (Get-NetFirewallRule -DisplayName "VR180Mirror Web (HTTPS 8443)" -ErrorAction SilentlyContinue)) {
-    Write-Host ""
-    Write-Host "FIREWALL: inbound rules missing - the Quest cannot connect without them." -ForegroundColor Yellow
-    Write-Host "          A UAC prompt will appear: please click YES once."               -ForegroundColor Yellow
-    & "$root\Setup-Firewall.ps1"
-}
+# ---- USB only: no LAN IP, no cert, no firewall rules needed ------------------
+# The web server is reached at http://localhost:9080 through an adb-reverse
+# tunnel, so there is no Wi-Fi listener to advertise or open a port for.
+$lanIp = "127.0.0.1"
 
 # ---- helpers ------------------------------------------------------------------
-function Test-Listening([int]$port) {
-    return [bool](Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)
-}
 function Get-OurProcess([string]$nameLike, [string]$cmdLike) {
     Get-CimInstance Win32_Process -Filter "Name = '$nameLike'" |
         Where-Object { $_.CommandLine -like "*$cmdLike*" }
+}
+
+# ---- USB spectator: establish the adb reverse tunnel for the target headset ----
+# Must run before the -ProvisionOnly early-exit below: it's what makes
+# http://localhost:9080 on the Quest resolve to this PC's web server at all.
+$adb = (Get-Command adb -ErrorAction SilentlyContinue).Source
+if (-not $adb) {
+    $adb = Get-ChildItem "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe",
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Google.PlatformTools*\platform-tools\adb.exe" `
+        -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+}
+$targetSerial = $Serial
+if ($adb) {
+    try {
+        $dev = (& $adb devices) -split "`n" | Select-Object -Skip 1 | Where-Object { $_ -match "\tdevice$" } |
+            ForEach-Object { ($_ -split "\t")[0] }
+        if (-not $targetSerial) {
+            if (@($dev).Count -eq 1) { $targetSerial = $dev }
+            elseif (@($dev).Count -gt 1) {
+                Write-Host "Multiple Quest headsets on USB - pass -Serial <id> to pick one. Devices: $($dev -join ', ')" -ForegroundColor Yellow
+            }
+        }
+        if ($targetSerial) {
+            $sArgs = @("-s", $targetSerial)
+            & $adb @sArgs reverse tcp:9080 tcp:9080 | Out-Null
+            Write-Host "USB spectator tunnel active (adb -s $targetSerial reverse tcp:9080)"
+        } else {
+            Write-Host "No USB Quest headset detected - plug it in and reverse the tunnel manually if needed" -ForegroundColor Yellow
+        }
+    } catch { }
+} else {
+    Write-Host "adb not found - USB spectator tunnel not established" -ForegroundColor Yellow
+}
+
+if ($ProvisionOnly) {
+    Write-Host "Provisioned: $Codec ${canvasW}x${canvasH}@${fps} ${Bitrate}kbps$(if ($Serial) { ", device $Serial" })"
+    exit 0
 }
 
 # ---- MediaMTX ------------------------------------------------------------------
 if (Get-OurProcess "mediamtx.exe" "VR180Mirror") {
     Write-Host "MediaMTX (VR180Mirror) already running"
 } else {
-    if (Test-Listening 9889) { throw "Port 9889 is already in use by something else" }
     Start-Process -FilePath "$root\tools\mediamtx\mediamtx.exe" `
         -ArgumentList "`"$root\tools\mediamtx\mediamtx.yml`"" `
         -WorkingDirectory "$root\tools\mediamtx"
-    Write-Host "MediaMTX started (WHIP/WHEP :9889, LL-HLS :9888)"
+    Write-Host "MediaMTX started (RTMP ingest :1936, LL-HLS :9888)"
 }
 
 # ---- web server -----------------------------------------------------------------
 if (Get-OurProcess "node.exe" "VR180Mirror\web\server.js") {
     Write-Host "Web server already running"
 } else {
-    Start-Process -FilePath "node" -ArgumentList "`"$root\web\server.js`"","--ip",$lanIp `
+    $webArgs = @("`"$root\web\server.js`"")
+    if ($Serial) { $webArgs += "--serial", $Serial }
+    Start-Process -FilePath "node" -ArgumentList $webArgs `
         -WorkingDirectory "$root\web"                      # visible console
-    Write-Host "Web server started (https :8443, http :9080)"
+    Write-Host "Web server started (http :9080)"
 }
 
 # ---- VR180Mirror -----------------------------------------------------------------
@@ -244,42 +261,19 @@ if (-not $NoOBS) {
     }
 }
 
-# ---- USB spectator: re-establish adb reverse tunnels if a headset is plugged ----
-$adb = (Get-Command adb -ErrorAction SilentlyContinue).Source
-if (-not $adb) {
-    $adb = Get-ChildItem "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe",
-        "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Google.PlatformTools*\platform-tools\adb.exe" `
-        -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
-}
-if ($adb) {
-    try {
-        $dev = (& $adb devices) -split "`n" | Select-Object -Skip 1 | Where-Object { $_ -match "\tdevice$" }
-        if (@($dev).Count -eq 1) {
-            & $adb reverse tcp:9080 tcp:9080 | Out-Null
-            & $adb reverse tcp:9189 tcp:9189 | Out-Null
-            Write-Host "USB spectator tunnels active (adb reverse 9080 + 9189)"
-        }
-    } catch { }
-}
-
 # ---- summary -----------------------------------------------------------------------
 Write-Host ""
 Write-Host "================= VR180 SPECTATOR READY ================="  -ForegroundColor Green
 Write-Host ""
-Write-Host " Stream: $Codec ${canvasW}x${canvasH} @ ${fps}fps"
+Write-Host " Stream: $Codec ${canvasW}x${canvasH} @ ${fps}fps (1.6x native on the Quest)"
 Write-Host ""
-Write-Host " SPECTATOR via USB cable (max quality/reliability):"
-Write-Host "   plug the spectator Quest into the PC, run .\Connect-SpectatorUSB.ps1,"
+Write-Host " USB cable ONLY - requires a USB 3.0 cable and a USB 3.0 port on the PC" -ForegroundColor Yellow
+Write-Host "   (USB 2.0 cannot carry the ~150 Mbps stream reliably)."                -ForegroundColor Yellow
+Write-Host ""
+Write-Host " SPECTATOR:"
+Write-Host "   plug the spectator Quest into a USB 3.0 port, run .\Connect-SpectatorUSB.ps1,"
 Write-Host "   then open  http://localhost:9080/"                       -ForegroundColor Cyan
-Write-Host "   (no certificate; video rides the cable; Connect -> Enter VR)"
-Write-Host ""
-Write-Host " SPECTATOR via Wi-Fi:"
-Write-Host "   Best (WebXR, ~0.3s):  https://${lanIp}:8443/"           -ForegroundColor Cyan
-Write-Host "     - accept the certificate warning (Advanced -> proceed)"
-Write-Host "     - tap 'Connect to stream', then 'Enter VR'"
-Write-Host "   No-cert fallback:     http://${lanIp}:9889/vr180"        -ForegroundColor Cyan
-Write-Host "     - fullscreen the video, set 180 + 3D left-right in the video bar"
-Write-Host "   DeoVR (HLS, 2-6s):    http://${lanIp}:9080/  in DeoVR (start with -Codec h264)"
+Write-Host "   (video rides the cable only; Connect -> Enter VR)"
 Write-Host ""
 Write-Host " On the PLAYER Quest: play PCVR through SteamVR"
 Write-Host "   (Virtual Desktop: set Streaming > OpenXR runtime = SteamVR)"

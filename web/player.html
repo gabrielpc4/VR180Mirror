@@ -56,17 +56,17 @@
   </div>
 
   <div class="row">
-    <label class="chk"><input type="radio" name="mode" id="mode-buf" checked> Max resolution (buffered ~2-4s)</label>
-    <label class="chk"><input type="radio" name="mode" id="mode-rtc"> Low latency (WebRTC, H264 only)</label>
-  </div>
-
-  <div class="row">
     <button id="enter-vr" disabled>🥽 Enter VR (180° immersive)</button>
     <label class="chk"><input type="checkbox" id="headlock"> Hard-lock to player's view (no free look)</label>
     <label class="chk"><input type="checkbox" id="muted" checked> Muted</label>
     <label class="chk" title="Removes the soft fade at the image border so the full rendered picture is visible. Any rounded corners that remain come from the game itself (pixels behind the lens mask are never rendered)."><input type="checkbox" id="fullpic"> Full picture (no edge softening)</label>
-    <label class="chk" title="Buffers ~1.5s so every frame plays at a constant 72fps even through hiccups — frames are delayed, never skipped. Adds latency."><input type="checkbox" id="delaypref"> Prefer delaying over skipping</label>
     <label class="chk" title="Live diagnostics panel at the center of view in VR: XR fps, video fps, drops, buffer, and the headset's GPU/CPU telemetry."><input type="checkbox" id="hud" checked> Show stats HUD in VR</label>
+  </div>
+  <div class="row">
+    <label class="chk" title="Multiplier on top of this headset's own recommended XR framebuffer size. Applied when you press Enter VR; change it and re-enter VR to take effect.">
+      Render scale <input type="range" id="renderscale" min="1.00" max="2.00" step="0.01" value="1.60" style="width:160px;vertical-align:middle">
+      <span id="renderscale-val">1.60x</span>
+    </label>
   </div>
   <div id="status2" style="color:#9aa0a6;font-size:.95rem"></div>
   <div id="stats"></div>
@@ -82,9 +82,7 @@ const video = $("video");
 const statusEl = $("status");
 const status2El = $("status2");
 
-let pc = null;
 let hls = null;
-let whepLocation = null;
 let xrSession = null;
 let connected = false;
 let fallbackTimer = null;
@@ -114,7 +112,6 @@ window.addEventListener("unhandledrejection", (e) =>
 
 function teardownTransports() {
   if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
-  if (pc) { try { pc.close(); } catch (e) {} pc = null; }
   if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
   wc.reset();
   video.srcObject = null;
@@ -327,84 +324,12 @@ async function hlsMseConnect() {
   setStatus("Buffering max-resolution stream…");
 }
 
-// ---------------------------------------------------------------- WHEP client
-async function whepConnect() {
-  const whepUrl = new URL("/whep", location.href).href;
-  pc = new RTCPeerConnection();
-  pc.addTransceiver("video", { direction: "recvonly" });
-  pc.addTransceiver("audio", { direction: "recvonly" });
-
-  const stream = new MediaStream();
-  pc.ontrack = (ev) => {
-    stream.addTrack(ev.track);
-    if (video.srcObject !== stream) video.srcObject = stream;
-    applyDelayPref();
-  };
-  pc.onconnectionstatechange = () => {
-    setStatus("WebRTC: " + pc.connectionState);
-    $("dot").classList.toggle("live", pc.connectionState === "connected");
-    if (pc.connectionState === "connected") {
-      connected = true;
-      $("overlay").classList.add("hidden");
-      updateVRButton();
-    }
-    if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
-      connected = false;
-      $("overlay").classList.remove("hidden");
-      $("connect").textContent = "▶ Reconnect";
-      $("connect").disabled = false;
-      updateVRButton();
-    }
-  };
-
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  await new Promise((res) => {
-    if (pc.iceGatheringState === "complete") return res();
-    const chk = () => { if (pc.iceGatheringState === "complete") { pc.removeEventListener("icegatheringstatechange", chk); res(); } };
-    pc.addEventListener("icegatheringstatechange", chk);
-    setTimeout(res, 1500);
-  });
-
-  const resp = await fetch(whepUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/sdp" },
-    body: pc.localDescription.sdp,
-  });
-  if (!resp.ok && resp.status !== 201) throw new Error("WHEP POST failed: " + resp.status);
-  whepLocation = resp.headers.get("Location");
-  let answer = await resp.text();
-  // USB mode: page served via adb-reverse on localhost. Keep only loopback ICE
-  // candidates so the media is forced through the USB tunnel instead of Wi-Fi.
-  if (["localhost", "127.0.0.1"].includes(location.hostname)) {
-    answer = answer.split("\r\n").filter((l) =>
-      !l.startsWith("a=candidate:") || l.includes("127.0.0.1")).join("\r\n");
-  }
-  await pc.setRemoteDescription({ type: "answer", sdp: answer });
-}
-
 $("connect").addEventListener("click", async () => {
   $("connect").disabled = true;
   setStatus("Connecting…");
   teardownTransports();
   try {
-    if ($("mode-rtc").checked) {
-      await whepConnect();
-      // if WebRTC connects but never decodes (unsupported codec / software
-      // decoder), fall back to the buffered hardware path automatically
-      fallbackTimer = setTimeout(async () => {
-        if (!video.videoWidth || video.readyState < 2) {
-          setStatus("WebRTC can't decode this stream — switching to buffered mode…");
-          teardownTransports();
-          $("mode-buf").checked = true;
-          try { await bufferedConnect(); } catch (e) { setStatus("Fallback failed: " + e.message); }
-          video.muted = $("muted").checked;
-          video.play().catch(() => {});
-        }
-      }, 5000);
-    } else {
-      await bufferedConnect();
-    }
+    await bufferedConnect();
     video.muted = $("muted").checked;
     await video.play().catch(() => {});
   } catch (e) {
@@ -413,13 +338,8 @@ $("connect").addEventListener("click", async () => {
   }
 });
 
-// pick the right default mode for the stream's codec (H264 = WebRTC capable;
-// HEVC/AV1 = buffered hardware path)
 fetch(new URL("/info", location.href)).then((r) => r.json()).then((i) => {
   const tracks = (i.tracks || []).join(",");
-  const rtcOk = tracks.includes("H264");
-  $("mode-rtc").checked = rtcOk;
-  $("mode-buf").checked = !rtcOk;
   status2El.textContent = "Stream: " + tracks + (i.ready ? " (live)" : " (waiting)");
 }).catch(() => {});
 
@@ -542,13 +462,14 @@ async function runGlDome() {
   // Resolution ceiling #1: the XR framebuffer. The default scale is the
   // runtime's *recommended* size, which is well below the panel's native
   // resolution - everything we draw gets resampled down to it. Ask for the
-  // native scale (and a little more when allowed) so the video's pixels
-  // actually reach the display. Foveation is off: it deliberately blurs the
-  // periphery, which is exactly the sharpness we are chasing.
+  // native scale times the user's chosen Render scale slider (RENDER_SCALE,
+  // 1.00-2.00) so the video's pixels actually reach the display. Foveation is
+  // off: it deliberately blurs the periphery, which is exactly the sharpness
+  // we are chasing.
   let fbScale = 1.0;
   try {
     const nat = XRWebGLLayer.getNativeFramebufferScaleFactor(xrSession);
-    if (nat > 0) fbScale = nat * SUPERSAMPLE;
+    if (nat > 0) fbScale = nat * RENDER_SCALE;
   } catch (e) {}
   // No MSAA: measured on this scene it cost the frame budget (p99 16.2ms ->
   // 41.0ms) while smoothing only the dome border and the HUD panel - the
@@ -783,19 +704,7 @@ async function runGlDome() {
 
 // ---------------------------------------------------------------- stats
 setInterval(async () => {
-  if (pc && pc.connectionState === "connected") {
-    const st = await pc.getStats();
-    let fps = 0, w = 0, h = 0, kbps = 0;
-    st.forEach((r) => {
-      if (r.type === "inbound-rtp" && r.kind === "video") {
-        fps = r.framesPerSecond || 0;
-        w = r.frameWidth || 0; h = r.frameHeight || 0;
-        kbps = Math.round(((r.bytesReceived - (window._pb || 0)) * 8) / 1000);
-        window._pb = r.bytesReceived;
-      }
-    });
-    $("stats").textContent = `WebRTC · ${w}x${h} @ ${fps}fps · ${kbps} kbit/s`;
-  } else if (wc.active) {
+  if (wc.active) {
     $("stats").textContent = `Direct decode · ${wc.w || "?"}x${wc.h || "?"} · shown ${wc.dispPerSec}/s`
       + ` · dec ${wc.outPerSec}/s · discarded ${wc.discPerSec}/s · held ${wc.heldPerSec}/s`
       + ` · latency ${((wc.queue.length + wc.pendingDepth) / 72).toFixed(1)}s`;
@@ -817,43 +726,57 @@ setInterval(async () => {
       try {
         const r = await navigator.mediaCapabilities.decodingInfo({
           type,
-          video: { contentType, width: 6144, height: 3072, framerate: 72, bitrate: 150000000 },
+          video: { contentType, width: 6144, height: 3264, framerate: 72, bitrate: 150000000 },
         });
         return r.supported ? (r.powerEfficient ? "hardware ✓" : "software (slow)") : "unsupported";
       } catch (e) { return "unknown"; }
     };
     const hevc = await q("media-source", 'video/mp4; codecs="hvc1.1.6.L183.B0"');
     const av1  = await q("media-source", 'video/mp4; codecs="av01.0.17M.08"');
-    $("cap").textContent = `Buffered 6144x3072@72 decode — HEVC: ${hevc} · AV1: ${av1}`;
+    $("cap").textContent = `Buffered 6144x3264@72 decode — HEVC: ${hevc} · AV1: ${av1}`;
   } catch (e) { /* probe unavailable; ignore */ }
 })();
 
-// "Prefer delaying over skipping": raise the WebRTC jitter-buffer target so
-// late frames wait in the buffer instead of being dropped. Combined with the
-// USB path's TCP transport (lossless), hiccups become latency, not skips.
-const DELAY_TARGET_MS = 1500;
-// Framebuffer supersample on top of the native scale. 1.0 = native panel
-// pixels; >1 renders larger and lets the compositor downsample (sharper edges,
-// more fill rate). Overridable with ?ss=1.25 for experiments.
-// 1.6 asks for more than the runtime will give: the framebuffer clamps at
-// 6144x4399 (3072 px per eye), which is exactly 1:1 with the 6144x3072 stream.
-// Anything above ~1.5 lands on that same ceiling - measured identical at 1.5,
-// 1.6, 1.8 and 2.0 - so this is the maximum the headset can display.
-// At 150 Mbps it is also the best measured pacing: 800 frames at p99 15.6ms,
-// max 16.9ms, 0 frames over 25ms, 0 stale, GPU 33%. (An earlier test called
-// 1.6 too heavy, but that was at 240 Mbps, where decoding competed with the
-// GPU for memory bandwidth.)
-const SUPERSAMPLE = Math.min(2.0, Math.max(0.8,
-  parseFloat(new URLSearchParams(location.search).get("ss")) || 1.6));
-function applyDelayPref() {
-  if (!pc) return;
-  const target = $("delaypref").checked ? DELAY_TARGET_MS : 0;
-  for (const r of pc.getReceivers()) {
-    try { r.jitterBufferTarget = target; } catch (e) {}
-    try { r.playoutDelayHint = target / 1000; } catch (e) {}   // older Chromium name
-  }
+// Render scale: a plain multiplier on top of this headset's own native/
+// recommended XR framebuffer scale (XRWebGLLayer.getNativeFramebufferScaleFactor),
+// picked from the slider in the pre-VR overlay (1.00-2.00, 0.01 steps). No
+// attempt to solve for a target pixel count - that assumed one headset's
+// default generalized to others and didn't (measured 3150x1650 base on one
+// Quest 3, 3840x2749 on another for the same slider value). Shared with the
+// PC's control panel through the same /settings bridge "Full picture" uses
+// (see pushFullpic below), so it can be dialed in by trial and error from the
+// desktop - the goal resolution is a known constant (6144x3264), so the right
+// multiplier only needs to be found once per headset. ?ss= still overrides
+// for a one-off link.
+let RENDER_SCALE = 1.6;
+async function pushRenderScale() {
+  try {
+    await fetch(new URL("/settings", location.href), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ renderScale: RENDER_SCALE }),
+    });
+  } catch (e) {}
 }
-$("delaypref").addEventListener("change", applyDelayPref);
+async function initRenderScale() {
+  const slider = $("renderscale"), label = $("renderscale-val");
+  const fromUrl = parseFloat(new URLSearchParams(location.search).get("ss"));
+  let fromServer = NaN;
+  try {
+    const s = await (await fetch(new URL("/settings", location.href))).json();
+    if (typeof s.renderScale === "number") fromServer = s.renderScale;
+  } catch (e) {}
+  RENDER_SCALE = Math.min(2.0, Math.max(1.0,
+    !isNaN(fromUrl) ? fromUrl : (!isNaN(fromServer) ? fromServer : 1.6)));
+  slider.value = RENDER_SCALE.toFixed(2);
+  label.textContent = RENDER_SCALE.toFixed(2) + "x";
+  slider.addEventListener("input", () => {
+    RENDER_SCALE = parseFloat(slider.value);
+    label.textContent = RENDER_SCALE.toFixed(2) + "x";
+    pushRenderScale();
+  });
+}
+initRenderScale();
 
 // "Full picture" toggles the PC-side edge feather via the /settings bridge.
 const FEATHER_DEFAULT = 1.5;
@@ -883,13 +806,8 @@ fetch(new URL("/settings", location.href)).then((r) => r.json()).then((s) => {
     $("fullpic").checked = q.get("fullpic") === "1";
     pushFullpic();
   }
-  if (q.has("delay")) $("delaypref").checked = q.get("delay") === "1";
   if (q.get("auto") === "1") setTimeout(() => $("connect").click(), 400);
 }
-
-window.addEventListener("beforeunload", () => {
-  if (whepLocation) navigator.sendBeacon && fetch(whepLocation, { method: "DELETE", keepalive: true }).catch(() => {});
-});
 </script>
 </body>
 </html>

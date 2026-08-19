@@ -1,17 +1,14 @@
-# MediaMTX config for VR180Mirror
-# Ingest:  OBS publishes WHIP (WebRTC) to http://127.0.0.1:9889/vr180/whip
-# Outputs: WHEP (WebRTC)  http://127.0.0.1:9889/vr180/whep  (proxied by web/server.js on :8443)
-#          LL-HLS         http://<lan-ip>:9888/vr180/index.m3u8  (DeoVR fallback)
-# Ports chosen to coexist with any other streaming stack on this PC
-# (8889/8189/8554/1935/8080 are left alone).
+# MediaMTX config for VR180Mirror (USB-only pipeline)
+# Ingest:  OBS publishes RTMP to  rtmp://127.0.0.1:1936/vr180
+# Output:  LL-HLS  http://127.0.0.1:9888/vr180/index.m3u8  (proxied by web/server.js
+#          on :9080, reached over the adb-reverse USB tunnel)
+# WebRTC/WHIP/WHEP and SRT are disabled: the spectator viewer only uses the
+# buffered LL-HLS + WebCodecs path over USB now.
 
 logLevel: info
 # visible console + log file (close the window and the launcher restarts it next run)
 logDestinations: [stdout, file]
 logFile: mediamtx.log
-
-# large socket buffer: the local WHIP publisher bursts RTP packets; avoid drops
-udpReadBufferSize: 4194304
 
 # local-only control API - used by Start-Spectator.ps1 to health-check ingest
 api: true
@@ -20,34 +17,17 @@ apiAddress: 127.0.0.1:9998
 rtsp: true
 rtspAddress: 127.0.0.1:9554
 rtspTransports: [tcp]
-# RTMP ingest (TCP): lossless on loopback. SRT is UDP and was dropping
-# packets at 120-150 Mbps - corrupt slices and missing keyframes downstream.
+# RTMP ingest (TCP): lossless on loopback. UDP transports (WHIP/SRT) were
+# dropping packets at 120-150 Mbps - corrupt slices and missing keyframes.
 rtmp: true
 rtmpAddress: 127.0.0.1:1936
 rtmpEncryption: "no"
-# SRT ingest from OBS: reliable on loopback (recovers lost packets), unlike
-# WHIP's plain UDP which dropped RTP under 150 Mbps keyframe bursts
-srt: true
-srtAddress: :9890
+srt: false
 moq: false
 playback: false
 metrics: false
 pprof: false
-
-webrtc: true
-# bound on all interfaces so the Quest can also use MediaMTX's built-in page
-# (http://<lan-ip>:9889/vr180) with the browser's fullscreen 180/3D mode
-webrtcAddress: :9889
-webrtcEncryption: false
-webrtcAllowOrigins: ["*"]
-webrtcLocalUDPAddress: :9189
-# ICE over TCP on the same port: lets the USB-cable spectator route WebRTC
-# media through an adb-reverse tunnel (Quest -> localhost -> PC), bypassing Wi-Fi
-webrtcLocalTCPAddress: :9189
-# Advertise loopback (for local OBS publisher) + the LAN IP (for the Quest).
-# Start-Spectator.ps1 rewrites the LAN entry to the current address on launch.
-webrtcIPsFromInterfaces: false
-webrtcAdditionalHosts: [127.0.0.1, 192.168.15.136]
+webrtc: false
 
 hls: true
 hlsAddress: :9888

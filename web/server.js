@@ -1,25 +1,20 @@
-// VR180Mirror web server
-//  - HTTPS :8443  -> serves player.html (WebXR needs a secure context) and
-//                    proxies WHEP signaling to MediaMTX on localhost:8889,
-//                    so the Quest only ever has to accept ONE certificate.
-//  - HTTP  :8080  -> DeoVR launch JSON (fallback player route, no TLS needed)
-//                    and a plain redirect/info page.
+// VR180Mirror web server (USB-only)
+//  - HTTP :9080 -> serves player.html and proxies MediaMTX's LL-HLS output.
+//    Reached over the adb-reverse USB tunnel (localhost on both ends), so no
+//    TLS is needed: WebXR treats http://localhost as a secure context.
 //
 // Usage: node server.js [--ip 192.168.0.14]
 "use strict";
 
-const https = require("https");
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const { URL } = require("url");
 
 const ROOT = __dirname;
-const MEDIAMTX = "http://127.0.0.1:9889";
 const STREAM_PATH = "vr180";
 const HLS_PORT = 9888;
-const HTTP_PORT = 9080;   // DeoVR JSON + info (8080 may be in use by other stacks)
-const HTTPS_PORT = 8443;
+const HTTP_PORT = 9080;   // reached via adb reverse over USB (8080 may be in use by other stacks)
 
 let lanIp = null;
 for (let i = 2; i < process.argv.length; i++) {
@@ -63,62 +58,14 @@ function serveStatic(req, res, pathname) {
   fs.createReadStream(full).pipe(res);
 }
 
-// ---- WHEP proxy -------------------------------------------------------------
-// POST /whep                -> POST  MediaMTX /vr180/whep      (offer -> answer)
-// PATCH/DELETE /whep-res/*  -> same on MediaMTX session resource
-function proxyWhep(req, res) {
-  const u = new URL(req.url, "http://x");
-  let target;
-  if (req.method === "POST" && u.pathname === "/whep") {
-    target = `${MEDIAMTX}/${STREAM_PATH}/whep`;
-  } else if (u.pathname.startsWith("/whep-res/")) {
-    target = MEDIAMTX + decodeURIComponent(u.pathname.replace("/whep-res", ""));
-  } else {
-    res.writeHead(404); res.end(); return;
-  }
-
-  const chunks = [];
-  req.on("data", (c) => chunks.push(c));
-  req.on("end", () => {
-    const body = Buffer.concat(chunks);
-    const t = new URL(target);
-    const preq = http.request(
-      {
-        hostname: t.hostname,
-        port: t.port,
-        path: t.pathname + t.search,
-        method: req.method,
-        headers: {
-          "Content-Type": req.headers["content-type"] || "application/sdp",
-          "Content-Length": body.length,
-          ...(req.headers["if-match"] ? { "If-Match": req.headers["if-match"] } : {}),
-        },
-      },
-      (pres) => {
-        const headers = {
-          "Content-Type": pres.headers["content-type"] || "application/sdp",
-          "Access-Control-Allow-Origin": "*",
-        };
-        if (pres.headers["location"]) {
-          // session resource lives on MediaMTX; expose it via our proxy path
-          headers["Location"] = "/whep-res" + pres.headers["location"].replace(/^https?:\/\/[^/]+/, "");
-        }
-        if (pres.headers["etag"]) headers["ETag"] = pres.headers["etag"];
-        res.writeHead(pres.statusCode, headers);
-        pres.pipe(res);
-      }
-    );
-    preq.on("error", (e) => {
-      res.writeHead(502, { "Content-Type": "text/plain" });
-      res.end("MediaMTX unreachable: " + e.message);
-    });
-    preq.end(body);
-  });
-}
-
 // ---- runtime settings bridge ---------------------------------------------------
-// The viewer toggles stream-side options (edge feather / "full picture"); we
-// persist them to bin\runtime.json, which VR180Mirror.exe watches live.
+// Two directions share this one file: the viewer posts stream-side options
+// (edge feather / "full picture"), which VR180Mirror.exe watches live; the PC's
+// control panel (VR180Console.exe) posts renderScale, which the viewer reads on
+// load so the headset's own XR framebuffer scale can be dialed in by trial and
+// error from the desktop without needing to touch the headset each time.
+// A POST merges into the existing file rather than replacing it, since either
+// side may only know about its own field.
 const RUNTIME_FILE = path.join(ROOT, "..", "bin", "runtime.json");
 function settings(req, res) {
   if (req.method === "POST") {
@@ -127,13 +74,17 @@ function settings(req, res) {
     req.on("end", () => {
       try {
         const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
-        const out = {};
+        let cur = {};
+        try { cur = JSON.parse(fs.readFileSync(RUNTIME_FILE, "utf8")); } catch (e) {}
         if (typeof body.feather === "number" && body.feather >= 0 && body.feather <= 20) {
-          out.feather = body.feather;
+          cur.feather = body.feather;
         }
-        fs.writeFileSync(RUNTIME_FILE, JSON.stringify(out));
+        if (typeof body.renderScale === "number" && body.renderScale >= 1.0 && body.renderScale <= 2.0) {
+          cur.renderScale = Math.round(body.renderScale * 100) / 100;
+        }
+        fs.writeFileSync(RUNTIME_FILE, JSON.stringify(cur));
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(out));
+        res.end(JSON.stringify(cur));
       } catch (e) {
         res.writeHead(400, { "Content-Type": "text/plain" });
         res.end("bad settings body");
@@ -179,7 +130,6 @@ function proxyHls(req, res, pathname, search) {
 
 function handler(req, res) {
   const u = new URL(req.url, "http://x");
-  if (u.pathname === "/whep" || u.pathname.startsWith("/whep-res/")) return proxyWhep(req, res);
   if (u.pathname === "/hls" || u.pathname.startsWith("/hls/")) return proxyHls(req, res, u.pathname, u.search);
   if (u.pathname === "/settings") return settings(req, res);
   if (u.pathname === "/clientlog" && req.method === "POST") {
@@ -201,7 +151,6 @@ function handler(req, res) {
     res.end(JSON.stringify(dev));
     return;
   }
-  if (u.pathname === "/deovr" || u.pathname === "/deovr.json") return deovr(req, res);
   if (u.pathname === "/info") {
     // Enriched status for the Quest launcher app: is the ingest live, which codec.
     const send = (extra) => {
@@ -210,9 +159,9 @@ function handler(req, res) {
       try { spans = JSON.parse(fs.readFileSync(path.join(ROOT, "..", "bin", "mirror_status.json"), "utf8")); } catch (e) {}
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       res.end(JSON.stringify({ app: "vr180mirror", lanIp, stream: STREAM_PATH,
-        httpsPort: HTTPS_PORT, httpPort: HTTP_PORT,
+        httpPort: HTTP_PORT,
         hspan: spans.hspan, vspan: spans.vspan, mirrorLive: spans.live === 1,
-        srcFps: spans.srcfps, ...extra }));
+        srcFps: spans.srcfps, canvasW: spans.canvasW, canvasH: spans.canvasH, ...extra }));
     };
     const req2 = http.get("http://127.0.0.1:9998/v3/paths/list", { timeout: 1500 }, (r2) => {
       let body = "";
@@ -231,22 +180,6 @@ function handler(req, res) {
   return serveStatic(req, res, u.pathname);
 }
 
-// ---- DeoVR fallback ----------------------------------------------------------
-// DeoVR's built-in browser: navigate to http://<ip>:8080/deovr — it detects the
-// JSON and opens the player. Uses MediaMTX LL-HLS output on :8888.
-function deovr(req, res) {
-  // DeoVR auto-fetches "/deovr" from a site root; flat single-video format.
-  const j = {
-    path: `http://${lanIp}:${HLS_PORT}/${STREAM_PATH}/index.m3u8`,
-    title: "VR180 Spectator — live PCVR view",
-    is3d: true,
-    screenType: "dome",     // 180 degree equirect
-    stereoMode: "sbs",      // side-by-side, left eye = left half
-  };
-  res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-  res.end(JSON.stringify(j));
-}
-
 // ---- headset telemetry (/devstats) ----------------------------------------------
 // Streams the Quest compositor's VrApi log line (FPS, stale frames, clock levels,
 // temperature) plus GPU busy % over adb, for the in-VR stats HUD.
@@ -261,10 +194,17 @@ const ADB = (() => {
   for (const c of cands) { try { if (c === "adb" || fs.existsSync(c)) return c; } catch (e) {} }
   return null;
 })();
+// which headset to read telemetry from, when more than one is plugged in
+// (set by Start-Spectator.ps1 -Serial, threaded through from the control panel)
+let adbSerial = null;
+for (let i = 2; i < process.argv.length; i++) {
+  if (process.argv[i] === "--serial") adbSerial = process.argv[++i];
+}
+const adbArgs = (args) => (adbSerial ? ["-s", adbSerial, ...args] : args);
 
 function startVrApiTail() {
   if (!ADB) return;
-  const p = spawn(ADB, ["logcat", "-s", "VrApi"], { windowsHide: true });
+  const p = spawn(ADB, adbArgs(["logcat", "-s", "VrApi"]), { windowsHide: true });
   p.stdout.on("data", (buf) => {
     const line = buf.toString();
     const m = line.match(/FPS=(\d+)\/(\d+).*?Stale=(\d+).*?CPU4\/GPU=(\d+)\/(\d+),(\d+)\/(\d+)MHz.*?Temp=([\d.]+)/);
@@ -280,7 +220,7 @@ function startVrApiTail() {
 startVrApiTail();
 if (ADB) {
   setInterval(() => {
-    execFile(ADB, ["shell", "cat", "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage"],
+    execFile(ADB, adbArgs(["shell", "cat", "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage"]),
       { windowsHide: true, timeout: 1500 }, (err, out) => {
         if (!err && out) { const n = parseInt(out, 10); if (!isNaN(n)) dev.gpuBusy = n; }
       });
@@ -288,22 +228,10 @@ if (ADB) {
 }
 
 // ---- start -------------------------------------------------------------------
-const certFile = path.join(ROOT, "cert.pem");
-const keyFile = path.join(ROOT, "key.pem");
-if (!fs.existsSync(certFile) || !fs.existsSync(keyFile)) {
-  console.error("cert.pem / key.pem missing — run setup.ps1 first");
-  process.exit(1);
-}
-
-https
-  .createServer({ cert: fs.readFileSync(certFile), key: fs.readFileSync(keyFile) }, handler)
-  .listen(HTTPS_PORT, () => {
-    console.log("");
-    console.log("  VR180 Spectator web server");
-    console.log("  ==========================");
-    console.log(`  Quest viewer (WebXR, lowest latency): https://${lanIp}:${HTTPS_PORT}/`);
-    console.log(`  DeoVR fallback (LL-HLS):              http://${lanIp}:${HTTP_PORT}/deovr`);
-    console.log("");
-  });
-
-http.createServer(handler).listen(HTTP_PORT);
+http.createServer(handler).listen(HTTP_PORT, () => {
+  console.log("");
+  console.log("  VR180 Spectator web server (USB only)");
+  console.log("  ======================================");
+  console.log(`  On the Quest (via adb reverse over USB): http://localhost:${HTTP_PORT}/`);
+  console.log("");
+});

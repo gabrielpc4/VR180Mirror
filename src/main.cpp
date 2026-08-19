@@ -305,11 +305,12 @@ static void writeStatusFile() {
     }
     FILE* f = nullptr;
     if (fopen_s(&f, path, "wb") == 0 && f) {
-        fprintf(f, "{\"hspan\":%.1f,\"vspan\":%.1f,\"live\":%d,\"srcfps\":%d}",
+        fprintf(f, "{\"hspan\":%.1f,\"vspan\":%.1f,\"live\":%d,\"srcfps\":%d,\"canvasW\":%d,\"canvasH\":%d}",
             vrs.hSpanRad * 180.0f / 3.14159265f,
             vrs.vSpanRad * 180.0f / 3.14159265f,
             vrs.haveMirror ? 1 : 0,
-            g_presentFps.load(std::memory_order_relaxed));
+            g_presentFps.load(std::memory_order_relaxed),
+            g_cfg.width, g_cfg.height);
         fclose(f);
     }
 }
@@ -432,6 +433,14 @@ static void vrTryConnect() {
     vrs.sys->GetStringTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd,
         vr::Prop_ManufacturerName_String, mfr, sizeof(mfr));
     logf("Connected to SteamVR. HMD: %s %s", mfr, model);
+    // The actual per-eye resolution the game renders at: SteamVR computes this
+    // from the headset's own recommended profile (Virtual Desktop's Godlike
+    // preset advertises its own to SteamVR) times the Video tab's render
+    // resolution %. Neither the panel's native spec nor Link's "1.0x" number
+    // apply here - this is the one SteamVR itself is actually asking for.
+    uint32_t rw = 0, rh = 0;
+    vrs.sys->GetRecommendedRenderTargetSize(&rw, &rh);
+    logf("SteamVR recommended render target: %ux%u per eye", rw, rh);
     vrRefreshProjection();
     logf("Proj L: [%.4f %.4f %.4f %.4f]  R: [%.4f %.4f %.4f %.4f]",
         vrs.projL[0], vrs.projL[1], vrs.projL[2], vrs.projL[3],

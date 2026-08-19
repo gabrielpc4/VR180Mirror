@@ -1,11 +1,15 @@
-# Routes the spectator stream over the Quest's USB cable via adb reverse
-# tunnels, instead of Wi-Fi. Requires Developer Mode enabled on the spectator
+# Routes the spectator stream over the Quest's USB cable via an adb reverse
+# tunnel. This is the ONLY supported spectator transport - it requires a
+# USB 3.0 cable and a USB 3.0 port on the PC (USB 2.0 cannot carry the
+# ~150 Mbps stream). Requires Developer Mode enabled on the spectator
 # headset (Meta Horizon app -> headset settings -> Developer Mode) and
 # accepting the "Allow USB debugging" prompt in the headset once.
 #
 # After this succeeds, open  http://localhost:9080/  in the Quest browser.
-# localhost is a secure context, so WebXR works with no certificate warning,
-# and the player page pins the WebRTC media to the loopback tunnel (the cable).
+# localhost is a secure context, so WebXR works with no certificate warning.
+#
+# Usage: .\Connect-SpectatorUSB.ps1 [-Serial <adb device id>]
+param([string]$Serial = "")
 $ErrorActionPreference = "Stop"
 
 # find adb (install Android platform-tools via winget if missing)
@@ -43,18 +47,16 @@ if (-not $ready) {
     Write-Host "   (Meta Horizon phone app -> Devices -> headset -> Developer Mode)"
     exit 1
 }
-if (@($ready).Count -gt 1) {
-    Write-Host "Multiple adb devices found - unplug the player headset or keep only the spectator connected." -ForegroundColor Yellow
+$serials = $ready | ForEach-Object { ($_ -split "\t")[0] }
+if (@($serials).Count -gt 1 -and -not $Serial) {
+    Write-Host "Multiple adb devices found - pass -Serial <id> to pick the spectator headset:" -ForegroundColor Yellow
     & $adb devices
     exit 1
 }
-
-$serial = ($ready[0] -split "\t")[0]
+$serial = if ($Serial) { $Serial } else { $serials }
 Write-Host "Spectator headset: $serial"
 
-# page + WHEP signaling (http server) and WebRTC media over ICE-TCP
 & $adb -s $serial reverse tcp:9080 tcp:9080
-& $adb -s $serial reverse tcp:9189 tcp:9189
 Write-Host ""
 Write-Host "USB tunnels active. On the spectator Quest, open:" -ForegroundColor Green
 Write-Host ""

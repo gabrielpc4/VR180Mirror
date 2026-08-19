@@ -1,5 +1,6 @@
 # build outputs & test artifacts
 bin/
+tools/VR180Console.exe
 
 # fetched dependencies (build.ps1 / Start-Spectator.ps1 re-fetch them)
 third_party/
