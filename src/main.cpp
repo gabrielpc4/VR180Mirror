@@ -124,6 +124,42 @@ static void logf(const char* fmt, ...) {
     fflush(stdout);
 }
 
+// Keep Windows' idle timers from blanking the display or sleeping the system
+// while OBS is capturing this process. Execution requirements are thread-local;
+// keeping this guard on main also guarantees an explicit reset on every normal
+// return path.
+class ExecutionStateGuard {
+public:
+    ExecutionStateGuard() {
+        const EXECUTION_STATE required = static_cast<EXECUTION_STATE>(
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+        SetLastError(ERROR_SUCCESS);
+        if (SetThreadExecutionState(required) == 0) {
+            const DWORD error = GetLastError();
+            logf("FATAL: Windows keep-awake request failed (error %lu); refusing to start", error);
+            return;
+        }
+        acquired_ = true;
+        logf("Windows keep-awake: system and display idle sleep disabled");
+    }
+
+    ~ExecutionStateGuard() {
+        if (SetThreadExecutionState(ES_CONTINUOUS) == 0) {
+            logf("WARNING: Windows keep-awake reset failed (error %lu)", GetLastError());
+        } else if (acquired_) {
+            logf("Windows keep-awake: default execution state restored");
+        }
+    }
+
+    ExecutionStateGuard(const ExecutionStateGuard&) = delete;
+    ExecutionStateGuard& operator=(const ExecutionStateGuard&) = delete;
+
+    bool acquired() const { return acquired_; }
+
+private:
+    bool acquired_ = false;
+};
+
 // ----------------------------------------------------------------------------
 // Shaders (compiled at runtime)
 // ----------------------------------------------------------------------------
@@ -656,6 +692,9 @@ static void setDpiAware() {
 }
 
 int main(int argc, char** argv) {
+    ExecutionStateGuard executionState;
+    if (!executionState.acquired()) return 1;
+
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> const char* { return (i + 1 < argc) ? argv[++i] : ""; };

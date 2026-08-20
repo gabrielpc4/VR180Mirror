@@ -89,6 +89,11 @@ Or drive it from PowerShell directly:
 .\Stop-Spectator.ps1                      # stops only this pipeline's processes
 ```
 
+For the lifetime of `VR180Mirror.exe`, the app asks Windows to keep both the system and
+display awake so an idle timeout cannot disturb OBS/DXGI capture. Startup fails clearly if
+Windows rejects that request; shutdown restores the default execution state and does not
+change the configured power plan.
+
 No firewall rules are needed — the whole path is a USB adb tunnel to `localhost`, nothing
 listens for inbound LAN connections.
 
