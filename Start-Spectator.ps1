@@ -17,6 +17,11 @@
 # =============================================================================
 param(
     [switch]$TestGrid,
+    # Capture VaM's native Oculus submission through Virtual Desktop instead
+    # of connecting to SteamVR.  Start this first, then launch
+    # "VaM (Virtual Desktop).bat" so the hook is armed before Unity resolves
+    # the LibOVR runtime.
+    [switch]$OculusVaM,
     [switch]$NoOBS,
     # hevc (default): 6144x3264@72 native, hardware decode via the page's
     # buffered WebCodecs path. av1/h264 remain valid OBS encoder choices at
@@ -42,6 +47,21 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
+
+if ($OculusVaM -and $TestGrid) {
+    throw "-OculusVaM and -TestGrid are mutually exclusive."
+}
+
+# A native-Oculus/Virtual Desktop run must not leave a SteamVR runtime behind:
+# VaM can otherwise select its OpenVR rig and make a seemingly-good capture
+# test an accidental SteamVR fallback.
+if ($OculusVaM) {
+    $steamVrProcesses = @(Get-Process -Name 'vrserver', 'vrcompositor' -ErrorAction SilentlyContinue)
+    if ($steamVrProcesses.Count -gt 0) {
+        $names = ($steamVrProcesses | ForEach-Object { "$($_.ProcessName) (PID $($_.Id))" }) -join ', '
+        throw "-OculusVaM requires SteamVR to be fully exited. Still running: $names"
+    }
+}
 
 # OBS Game Capture and RivaTuner Statistics Server both hook DXGI Present.
 # Co-injection freezes OBS on one frame, so refuse to launch or reuse our
@@ -165,9 +185,11 @@ else                  { $canvasW = 3840; $canvasH = 1920; $encoderId = "obs_nven
 if ($Bitrate -le 0) { $Bitrate = $defBitrate }
 
 # ---- first-run provisioning ----------------------------------------------------
-if (-not (Test-Path "$root\bin\VR180Mirror.exe")) {
-    Write-Host "VR180Mirror.exe not built yet - running build.ps1..."
+if ($OculusVaM -or -not (Test-Path "$root\bin\VR180Mirror.exe")) {
+    $buildDetail = if ($OculusVaM) { " with the VaM Oculus capture hook" } else { "" }
+    Write-Host "Building VR180Mirror$buildDetail..."
     & "$root\build.ps1"
+    if ($LASTEXITCODE -ne 0) { throw "VR180Mirror build failed" }
 }
 if (-not (Test-Path "$root\tools\mediamtx\mediamtx.exe")) {
     Write-Host "Downloading MediaMTX (WebRTC/HLS server)..."
@@ -221,6 +243,13 @@ $lanIp = "127.0.0.1"
 function Get-OurProcess([string]$nameLike, [string]$cmdLike) {
     Get-CimInstance Win32_Process -Filter "Name = '$nameLike'" |
         Where-Object { $_.CommandLine -like "*$cmdLike*" }
+}
+
+function Get-OurMirrorProcess {
+    $mirrorPath = [IO.Path]::GetFullPath((Join-Path $root 'bin\VR180Mirror.exe'))
+    Get-CimInstance Win32_Process -Filter "Name = 'VR180Mirror.exe'" |
+        Where-Object { $_.ExecutablePath -and
+            ([IO.Path]::GetFullPath($_.ExecutablePath) -ieq $mirrorPath) }
 }
 
 # ---- USB spectator: establish the adb reverse tunnel for the target headset ----
@@ -282,8 +311,14 @@ if (Get-OurProcess "node.exe" "VR180Mirror\web\server.js") {
 }
 
 # ---- VR180Mirror -----------------------------------------------------------------
-if (Get-OurProcess "VR180Mirror.exe" "VR180Mirror") {
-    Write-Host "VR180Mirror already running"
+$activeMirror = @(Get-OurMirrorProcess)
+if ($activeMirror) {
+    $wantedMode = if ($OculusVaM) { "Oculus/Virtual Desktop" } else { "SteamVR" }
+    $hasOculusMode = @($activeMirror | Where-Object { $_.CommandLine -match '(^|\s)--oculus-vam(\s|$)' }).Count -gt 0
+    if (($OculusVaM -and -not $hasOculusMode) -or (-not $OculusVaM -and $hasOculusMode)) {
+        throw "VR180Mirror is already running in the other capture mode. Gracefully close it (or run Stop-Spectator.ps1), then rerun this launcher for $wantedMode."
+    }
+    Write-Host "VR180Mirror already running ($wantedMode)"
 } else {
     # Source render rate. It matched the stream rate originally, was raised to 2x
     # while the render loop still had stalls (a stalled loop makes the capture
@@ -295,9 +330,10 @@ if (Get-OurProcess "VR180Mirror.exe" "VR180Mirror") {
     $mirrorArgs = @("--size","${canvasW}x${canvasH}","--fps","$([int]($fps * $SourceFpsScale))","--preview","1280")
     if ($VR180) { $mirrorArgs += "--vr180" }
     if ($TestGrid) { $mirrorArgs += "--test-grid" }
+    if ($OculusVaM) { $mirrorArgs += "--oculus-vam" }
     Start-Process -FilePath "$root\bin\VR180Mirror.exe" -ArgumentList $mirrorArgs `
         -WorkingDirectory "$root\bin"
-    Write-Host "VR180Mirror started $(if ($TestGrid) { '(TEST GRID)' })"
+    Write-Host "VR180Mirror started $(if ($OculusVaM) { '(VaM native Oculus / Virtual Desktop)' } elseif ($TestGrid) { '(TEST GRID)' })"
 }
 
 # ---- OBS --------------------------------------------------------------------------
@@ -366,8 +402,13 @@ Write-Host "   plug the spectator Quest into a USB 3.0 port, run .\Connect-Spect
 Write-Host "   then open  http://localhost:9080/"                       -ForegroundColor Cyan
 Write-Host "   (video rides the cable only; Connect -> Enter VR)"
 Write-Host ""
-Write-Host " On the PLAYER Quest: play PCVR through SteamVR"
-Write-Host "   (Virtual Desktop: set Streaming > OpenXR runtime = SteamVR)"
+if ($OculusVaM) {
+    Write-Host " On the PLAYER Quest: launch VaM (Virtual Desktop).bat with SteamVR fully closed" -ForegroundColor Cyan
+    Write-Host "   VR180Mirror is armed first and will attach to VaM's native Oculus eye textures."
+} else {
+    Write-Host " On the PLAYER Quest: play PCVR through SteamVR"
+    Write-Host "   (Virtual Desktop: set Streaming > OpenXR runtime = SteamVR)"
+}
 Write-Host ""
 Write-Host " Stop everything:  .\Stop-Spectator.ps1"
 Write-Host "=========================================================="

@@ -82,6 +82,12 @@ function settings(req, res) {
         if (typeof body.renderScale === "number" && body.renderScale >= 1.0 && body.renderScale <= 2.0) {
           cur.renderScale = Math.round(body.renderScale * 100) / 100;
         }
+        // Source-pose stabilization is intentionally opt-in.  The mirror
+        // watches this field live, so switching arms never restarts VaM,
+        // OBS, MediaMTX, or the spectator player.
+        if (typeof body.stabilization === "boolean") {
+          cur.stabilization = body.stabilization;
+        }
         fs.writeFileSync(RUNTIME_FILE, JSON.stringify(cur));
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(cur));
@@ -161,7 +167,11 @@ function handler(req, res) {
       res.end(JSON.stringify({ app: "vr180mirror", lanIp, stream: STREAM_PATH,
         httpPort: HTTP_PORT,
         hspan: spans.hspan, vspan: spans.vspan, mirrorLive: spans.live === 1,
-        srcFps: spans.srcfps, canvasW: spans.canvasW, canvasH: spans.canvasH, ...extra }));
+        srcFps: spans.srcfps, gameFps: spans.gamefps,
+        stabilization: spans.stabilization === 1,
+        sourcePoseValid: spans.sourcePoseValid === 1,
+        stabilizationCorrectionDeg: spans.stabilizationCorrectionDeg || 0,
+        canvasW: spans.canvasW, canvasH: spans.canvasH, ...extra }));
     };
     const req2 = http.get("http://127.0.0.1:9998/v3/paths/list", { timeout: 1500 }, (r2) => {
       let body = "";

@@ -31,10 +31,14 @@ $cmd = "call `"$vcvars`" >nul 2>&1 && cl /nologo /O2 /EHsc /std:c++17 /W3 /DUNIC
        "/I `"$root\third_party\openvr\headers`" " +
        "`"$root\src\main.cpp`" " +
        "/Fe:`"$out\VR180Mirror.exe`" /Fo:`"$out\main.obj`" " +
-       "/link `"$root\third_party\openvr\lib\win64\openvr_api.lib`" /SUBSYSTEM:CONSOLE"
+       "/link `"$root\third_party\openvr\lib\win64\openvr_api.lib`" /SUBSYSTEM:CONSOLE && " +
+       "cl /nologo /O2 /EHsc /std:c++17 /W3 /LD /DUNICODE /D_UNICODE " +
+       "`"$root\src\oculus_hook.cpp`" " +
+       "/Fe:`"$out\VR180OculusHook.dll`" /Fo:`"$out\oculus_hook.obj`" " +
+       "/link /SUBSYSTEM:WINDOWS"
 
 cmd /c $cmd
 if ($LASTEXITCODE -ne 0) { throw "Build failed" }
 
 Copy-Item "$root\third_party\openvr\bin\win64\openvr_api.dll" $out -Force
-Write-Host "Build OK -> $out\VR180Mirror.exe"
+Write-Host "Build OK -> $out\VR180Mirror.exe + VR180OculusHook.dll"

@@ -2,16 +2,16 @@
 
 One PC, two Meta Quest 3 headsets:
 
-- **Player** plays any PCVR game through **SteamVR** (Virtual Desktop, Steam Link, or Link cable).
+- **Player** plays a PCVR game through **SteamVR** (Virtual Desktop, Steam Link, or Link cable), or VaM through Virtual Desktop's native Oculus runtime.
 - **Spectator** puts on the second Quest and sees **exactly what the player sees** — both eyes,
   first person, projected as **side-by-side half, 180° equirectangular (lat/long)** — view only,
   no controllers needed.
 
 ```
- Player Quest 3 ──(VD / Steam Link)── SteamVR ──┐
+Player Quest 3 ──(VD / Steam Link)── SteamVR ──┐
                                                 │ compositor mirror textures (L+R eyes)
                                                 ▼
-                                   VR180Mirror.exe  (this project)
+                                    VR180Mirror.exe  (this project)
                                    reprojects each eye's rectilinear view
                                    onto a 180° dome using the exact per-eye
                                    projection tangents → SBS half-equirect window
@@ -24,7 +24,7 @@ One PC, two Meta Quest 3 headsets:
                                                 viewer (WebCodecs), ~1 s
                                                 │
                                                 ▼
-                                   Spectator Quest 3, over a USB 3.0 cable ONLY
+                                    Spectator Quest 3, over a USB 3.0 cable ONLY
                                    (adb reverse tunnel — no Wi-Fi transport exists)
 ```
 
@@ -85,6 +85,7 @@ Or drive it from PowerShell directly:
 .\Start-Spectator.ps1 -Bitrate 100000     # lower bitrate (kbps)
 .\Start-Spectator.ps1 -Serial <adb-id>    # target a specific headset when more than one is plugged in
 .\Start-Spectator.ps1 -TestGrid           # same, but streams a calibration grid (no SteamVR needed)
+.\Start-Spectator.ps1 -OculusVaM -VR180  # VaM through Virtual Desktop's native Oculus runtime
 .\Connect-SpectatorUSB.ps1 [-Serial <id>] # (re-)establish the adb-reverse tunnel after a re-plug
 .\Stop-Spectator.ps1                      # stops only this pipeline's processes
 ```
@@ -107,18 +108,36 @@ Then just run `Start-Spectator.ps1` — on first run it builds `VR180Mirror.exe`
 OpenVR SDK), downloads MediaMTX, and installs the OBS profile + scene collection from `obs\`
 (also available standalone as `Install-OBSProfile.ps1`).
 
-The pipeline is order-independent and self-healing: VR180Mirror waits for SteamVR and switches
-from the idle grid to the live feed automatically when the player starts playing; OBS retries the
-stream; the spectator can join/leave any time.
+The SteamVR pipeline is order-independent and self-healing: VR180Mirror waits for SteamVR and
+switches from the idle grid to the live feed automatically when the player starts playing; OBS
+retries the stream; the spectator can join/leave any time.
 
-## Player headset — one required setting
+### VaM through Virtual Desktop without SteamVR
 
-The capture reads the **SteamVR compositor**, so the game must run through SteamVR:
+For `D:\Games\VaM\1_22_0_3\VaM (Virtual Desktop).bat`, start the spectator stack first:
+
+```powershell
+.\Start-Spectator.ps1 -OculusVaM -VR180 -Serial <spectator-adb-id>
+```
+
+Then launch the batch unchanged. It runs `VaM.exe -vrmode oculus`; `VR180Mirror` injects its
+native Oculus capture hook before Unity resolves the Virtual Desktop LibOVR runtime. This path
+does **not** start or use SteamVR. The launcher refuses `-OculusVaM` while `vrserver` or
+`vrcompositor` are running, preventing an accidental OpenVR fallback. `srcFps` remains the
+72 Hz spectator canvas cadence; `/info` exposes the game submission rate separately as `gameFps`
+when it is variable.
+
+## Player headset — SteamVR mode
+
+The default capture reads the **SteamVR compositor**, so the game must run through SteamVR:
 
 - **Virtual Desktop**: in the Streamer app (or VD's Streaming tab), set **OpenXR runtime = SteamVR**
   (not VDXR / not Automatic — Automatic runs MSFS, DCS and Vail on VDXR, which bypasses SteamVR).
 - **Steam Link**: nothing to do (always SteamVR; set SteamVR as the OpenXR runtime if asked).
 - **Link cable / Air Link**: launch the game in SteamVR mode (OpenVR titles do this automatically).
+
+For the native VaM/Virtual Desktop path above, fully exit SteamVR and do not change Virtual
+Desktop's OpenXR runtime to SteamVR; the game must stay on its Oculus runtime.
 
 ## Spectator headset
 
@@ -239,6 +258,30 @@ Ports used (all loopback-only, reached via the adb-reverse USB tunnel): 9080 (we
 .\build.ps1              # needs MSVC Build Tools; outputs bin\VR180Mirror.exe
 .\tools\build-console.ps1  # rebuilds tools\VR180Console.exe (in-box csc.exe, no SDK needed)
 ```
+
+## Source-pose stabilization POC
+
+The optional POC stabilizes small-to-medium *source headset* rotation in the
+PC reprojection stage. It is **off by default** and currently applies to the
+direct VaM/Virtual Desktop Oculus path, where every submitted texture pair
+carries its matching LibOVR `RenderPose`.
+
+Turn it on or off while the pipeline is live; neither action restarts VaM,
+OBS, MediaMTX, or the spectator:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:9080/settings -Method Post -ContentType application/json -Body '{"stabilization":true}'
+Invoke-RestMethod http://127.0.0.1:9080/settings -Method Post -ContentType application/json -Body '{"stabilization":false}'
+```
+
+`/info` reports the current mode, whether a source pose is valid, and the
+bounded correction angle. Use `--pose-trace C:\path\head-pose.csv` on the
+mirror to record synchronized, real submitted poses for later off/on analysis.
+Run `VR180Mirror.exe --pose-trace-check C:\path\head-pose.csv` to replay the
+same bounded filter offline and report its maximum observed pose step and
+correction; it can read an active trace without interrupting the mirror.
+The POC uses rotational stabilization only; it never invents positional depth
+or changes the 6144x3264/72-Hz stream contract.
 
 ## Considering a native OpenXR client
 
