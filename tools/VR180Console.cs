@@ -122,66 +122,86 @@ public class ConsoleForm : Form
         BackColor = Bg;
         StartPosition = FormStartPosition.CenterScreen;
 
-        var top = new Panel { Dock = DockStyle.Top, Height = 44, BackColor = Bg };
-        startBtn = MakeButton("Start pipeline", 8);
+        // Everything below uses AutoSize controls inside FlowLayoutPanels instead
+        // of fixed pixel Left/Top/Width. A fixed-pixel layout (this file's first
+        // attempt) clipped text badly under Windows display scaling: WinForms'
+        // own Dpi/Font auto-scale machinery does not reliably rescale absolute-
+        // positioned children on an older-style per-monitor-aware manifest, so a
+        // control sized for 96 DPI stayed that size while its text rendered at
+        // the monitor's real (scaled) font size and overflowed the box. AutoSize
+        // has no such gap: it measures the control's actual on-screen content at
+        // whatever DPI/font is really in effect, so there is nothing to get out
+        // of sync. FlowLayoutPanel with WrapContents also means the whole config
+        // bar reflows instead of clipping if the window is narrower.
+        var topFlow = new FlowLayoutPanel {
+            Dock = DockStyle.Top, FlowDirection = FlowDirection.LeftToRight, WrapContents = true,
+            AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, BackColor = Bg,
+            Padding = new Padding(8, 8, 8, 4),
+        };
+        startBtn = MakeButton("Start pipeline");
         startBtn.Click += (s, e) => { if (!pipelineStarted) StartPipeline(args); };
-        stopBtn = MakeButton("Stop everything", 150);
+        stopBtn = MakeButton("Stop everything");
         stopBtn.Click += (s, e) => Close();
-        copyBtn = MakeButton("Copy all logs", 292);
+        copyBtn = MakeButton("Copy all logs");
         copyBtn.Click += (s, e) => {
             try { Clipboard.SetText(logBox.Text); Log("sys", "logs copied to the clipboard", Accent); } catch { }
         };
-        saveBtn = MakeButton("Save logs...", 434);
+        saveBtn = MakeButton("Save logs...");
         saveBtn.Click += (s, e) => SaveLogs();
         autoScroll = new CheckBox {
-            Text = "Follow", Checked = true, ForeColor = Dim, Left = 576, Top = 10, Width = 70, BackColor = Bg
+            Text = "Follow", Checked = true, ForeColor = Dim, AutoSize = true, BackColor = Bg,
+            Margin = new Padding(12, 10, 0, 0),
         };
-        top.Controls.AddRange(new Control[] { startBtn, stopBtn, copyBtn, saveBtn, autoScroll });
+        topFlow.Controls.AddRange(new Control[] { startBtn, stopBtn, copyBtn, saveBtn, autoScroll });
 
         // ---- config bar: resolution/bitrate/target headset, before starting -------
-        // Labels are AutoSize so text can never clip regardless of DPI/font;
-        // combo/button Lefts below give each enough room for its widest label.
-        var cfg = new Panel { Dock = DockStyle.Top, Height = 118, BackColor = Bg };
-        var resLbl = new Label { Text = "Resolution", ForeColor = Dim, Left = 10, Top = 6, AutoSize = true, BackColor = Bg };
-        resCombo = new ComboBox { Left = 10, Top = 26, Width = 230, DropDownStyle = ComboBoxStyle.DropDownList };
+        var cfgFlow = new FlowLayoutPanel {
+            Dock = DockStyle.Top, FlowDirection = FlowDirection.LeftToRight, WrapContents = true,
+            AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, BackColor = Bg,
+            Padding = new Padding(8, 4, 8, 8),
+        };
+
+        resCombo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
         resCombo.Items.AddRange(ResChoices); resCombo.SelectedIndex = 0;
+        SizeCombo(resCombo);
 
-        var brLbl = new Label { Text = "Bitrate (Mbps)", ForeColor = Dim, Left = 256, Top = 6, AutoSize = true, BackColor = Bg };
-        bitrateCombo = new ComboBox { Left = 256, Top = 26, Width = 140, DropDownStyle = ComboBoxStyle.DropDownList };
+        bitrateCombo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
         bitrateCombo.Items.AddRange(BitrateChoices); bitrateCombo.SelectedIndex = 4;   // 150 (default)
+        SizeCombo(bitrateCombo);
 
-        var devLbl = new Label { Text = "Target headset (USB)", ForeColor = Dim, Left = 412, Top = 6, AutoSize = true, BackColor = Bg };
-        deviceCombo = new ComboBox { Left = 412, Top = 26, Width = 270, DropDownStyle = ComboBoxStyle.DropDownList };
+        deviceCombo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
         deviceCombo.Items.Add("(auto - single device)");
         deviceCombo.SelectedIndex = 0;
-        refreshDevBtn = MakeButton("Refresh devices", 696);
-        refreshDevBtn.Top = 26; refreshDevBtn.Height = 26; refreshDevBtn.Width = 140;
+        SizeCombo(deviceCombo);
+        refreshDevBtn = MakeButton("Refresh devices");
         refreshDevBtn.Click += (s, e) => PopulateDevices();
 
-        measureBtn = MakeButton("Measure USB speed", 10);
-        measureBtn.Top = 58; measureBtn.Height = 26; measureBtn.Width = 170;
+        measureBtn = MakeButton("Measure USB speed");
         measureBtn.Click += (s, e) => MeasureUsbSpeed();
         measureLabel = new Label {
-            Text = "not measured yet", ForeColor = Dim, Left = 190, Top = 63, AutoSize = true, MaximumSize = new Size(960, 0), BackColor = Bg
+            Text = "not measured yet", ForeColor = Dim, AutoSize = true, MaximumSize = new Size(700, 0),
+            BackColor = Bg, Margin = new Padding(4, 10, 0, 0),
         };
 
         // Render scale: mirrors the slider on the headset's own page (both read/write
         // the same /settings bridge), so the multiplier that lands on the goal
         // resolution (native canvas above, e.g. 6144x3264) can be found by trial and
         // error from here without putting the headset on each time.
-        var rsLbl = new Label { Text = "Quest render scale", ForeColor = Dim, Left = 10, Top = 90, AutoSize = true, BackColor = Bg };
         renderScaleNud = new NumericUpDown {
-            Left = 160, Top = 86, Width = 70, Minimum = 1.00m, Maximum = 2.00m,
-            Increment = 0.01m, DecimalPlaces = 2, Value = 1.50m
+            Width = 70, Minimum = 1.00m, Maximum = 2.00m, Increment = 0.01m, DecimalPlaces = 2, Value = 1.50m,
         };
         renderScaleNud.ValueChanged += (s, e) => PushRenderScale();
         var rsHint = new Label {
-            Text = "applies next time the headset presses Enter VR", ForeColor = Dim, Left = 238, Top = 90, AutoSize = true, BackColor = Bg
+            Text = "applies next time the headset presses Enter VR", ForeColor = Dim, AutoSize = true,
+            BackColor = Bg, Margin = new Padding(6, 4, 0, 0),
         };
 
-        cfg.Controls.AddRange(new Control[] {
-            resLbl, resCombo, brLbl, bitrateCombo, devLbl, deviceCombo, refreshDevBtn, measureBtn, measureLabel,
-            rsLbl, renderScaleNud, rsHint
+        cfgFlow.Controls.AddRange(new Control[] {
+            MakeField("Resolution", resCombo),
+            MakeField("Bitrate (Mbps)", bitrateCombo),
+            MakeField("Target headset (USB)", MakeRow(deviceCombo, refreshDevBtn)),
+            MakeRow(measureBtn, measureLabel),
+            MakeField("Quest render scale", MakeRow(renderScaleNud, rsHint)),
         });
 
         statusLabel = new Label {
@@ -198,19 +218,61 @@ public class ConsoleForm : Form
 
         Controls.Add(logBox);
         Controls.Add(statusLabel);
-        Controls.Add(cfg);
-        Controls.Add(top);
+        Controls.Add(cfgFlow);
+        Controls.Add(topFlow);
 
         Shown += (s, e) => PopulateDevices();
         FormClosing += (s, e) => Shutdown();
     }
 
-    Button MakeButton(string text, int left)
+    static Button MakeButton(string text)
     {
         return new Button {
-            Text = text, Left = left, Top = 6, Width = 130, Height = 28,
-            FlatStyle = FlatStyle.Flat, ForeColor = Ink, BackColor = ColorTranslator.FromHtml("#1b2530")
+            Text = text, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Padding = new Padding(12, 4, 12, 4), Margin = new Padding(0, 0, 8, 0), MinimumSize = new Size(0, 28),
+            FlatStyle = FlatStyle.Flat, ForeColor = Ink, BackColor = ColorTranslator.FromHtml("#1b2530"),
         };
+    }
+
+    // A label above a control, both AutoSize, stacked vertically - the "field"
+    // unit the config bar is built from.
+    static FlowLayoutPanel MakeField(string labelText, Control control)
+    {
+        var lbl = new Label { Text = labelText, ForeColor = Dim, AutoSize = true, BackColor = Bg, Margin = new Padding(0, 0, 0, 2) };
+        var col = new FlowLayoutPanel {
+            FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink, BackColor = Bg, Margin = new Padding(0, 0, 28, 12),
+        };
+        col.Controls.Add(lbl);
+        col.Controls.Add(control);
+        return col;
+    }
+
+    // Controls placed side by side (e.g. a combo + its refresh button).
+    static FlowLayoutPanel MakeRow(params Control[] controls)
+    {
+        var row = new FlowLayoutPanel {
+            FlowDirection = FlowDirection.LeftToRight, WrapContents = false, AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink, BackColor = Bg, Margin = new Padding(0),
+        };
+        foreach (var c in controls) { c.Margin = new Padding(0, 0, 8, 0); row.Controls.Add(c); }
+        return row;
+    }
+
+    // ComboBox does not AutoSize to its content in WinForms, so measure the
+    // widest item against the control's own (already correctly DPI-scaled)
+    // Font at runtime, rather than guessing a fixed pixel width that only
+    // happens to fit at 100% scaling.
+    static void SizeCombo(ComboBox combo, int extraPx = 40)
+    {
+        int w = 60;
+        using (var g = combo.CreateGraphics()) {
+            foreach (var item in combo.Items) {
+                int iw = (int)g.MeasureString(item.ToString(), combo.Font).Width;
+                if (iw > w) w = iw;
+            }
+        }
+        combo.Width = w + extraPx;
     }
 
     // ---------------------------------------------------------------- logging
@@ -397,6 +459,7 @@ public class ConsoleForm : Form
         }
         foreach (var s in found) deviceCombo.Items.Add(s + "  (Quest, USB)");
         deviceCombo.SelectedIndex = 0;
+        SizeCombo(deviceCombo);   // device serials can be wider than the placeholder text
         Log("sys", found.Count == 0 ? "no adb devices found (plug in the spectator Quest, USB debugging authorized)"
             : found.Count + " adb device(s) found: " + string.Join(", ", found), found.Count == 0 ? Warn : Accent);
     }
