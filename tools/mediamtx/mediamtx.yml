@@ -37,7 +37,10 @@ hlsVariant: lowLatency
 # 150 Mbps means a 1s segment is ~19MB and a keyframe-heavy scene can spike
 # well past MediaMTX's 50MB default, which crashed the muxer
 hlsSegmentMaxSize: 250M
-hlsSegmentCount: 7
+# Keep a deep live window for the native Quest client's stability-first
+# 12-second live offset and 8-12-second compressed buffer. This does not change
+# the browser viewer's chosen latency; it only retains older segments longer.
+hlsSegmentCount: 30
 hlsSegmentDuration: 1s
 hlsPartDuration: 200ms
 hlsAlwaysRemux: true
@@ -45,4 +48,3 @@ hlsAlwaysRemux: true
 paths:
   vr180:
     source: publisher
-
