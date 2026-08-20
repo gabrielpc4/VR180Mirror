@@ -214,6 +214,12 @@ Ports used (all loopback-only, reached via the adb-reverse USB tunnel): 9080 (we
   headset as `device` (not `unauthorized`/`offline`), and confirm the cable/port are USB 3.0
   with the Console's **Measure USB speed** button.
 - **Black video in OBS/stream** → don't minimize the VR180Mirror window (background is fine).
+- **OBS/stream is frozen on one frame while the VR180Mirror preview moves** → RTSS/MSI
+  Afterburner is injecting a competing DXGI hook. Add `bin\VR180Mirror.exe` to
+  RTSS and set **Application detection level** to **None** (`VR180Mirror.exe.cfg` must contain
+  one `[Hooking]` section with the exact assignment `EnableHooking=0`), then fully
+  restart VR180Mirror. The launcher fails closed when RTSS is running without the exclusion,
+  or when an existing mirror still has the hook loaded; RTSS can remain enabled for games.
 - **Grid shows but game never appears** → SteamVR isn't the compositor: check the VD OpenXR
   runtime setting (see above). The VR180Mirror console logs the connection state.
 - **Stereo feels wrong/painful** → `--swap-eyes` in the launcher's `$mirrorArgs`.

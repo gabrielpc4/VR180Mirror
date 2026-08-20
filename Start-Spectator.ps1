@@ -43,6 +43,97 @@ param(
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 
+# OBS Game Capture and RivaTuner Statistics Server both hook DXGI Present.
+# Co-injection freezes OBS on one frame, so refuse to launch or reuse our
+# mirror unless RTSS is excluded from this executable.
+function Test-RtssMirrorExclusion([string]$profilePath) {
+    if (-not (Test-Path -LiteralPath $profilePath -PathType Leaf)) { return $false }
+
+    $inHooking = $false
+    $hookingSections = 0
+    $hookingAssignments = 0
+    try { $profileLines = Get-Content -LiteralPath $profilePath } catch { return $false }
+    foreach ($line in $profileLines) {
+        $setting = $line.Trim()
+        if ($setting.StartsWith("[") -and $setting.EndsWith("]")) {
+            $inHooking = $setting -ieq "[Hooking]"
+            if ($inHooking) {
+                $hookingSections++
+                if ($setting -cne "[Hooking]") { return $false }
+            }
+            continue
+        }
+        if ($inHooking -and $setting -imatch '^EnableHooking\s*=') {
+            $hookingAssignments++
+            if ($setting -cne "EnableHooking=0") { return $false }
+        }
+    }
+    # RTSS INI names are case-insensitive. Require exactly one canonical
+    # section and assignment so a duplicate or case-variant cannot override it.
+    return $hookingSections -eq 1 -and $hookingAssignments -eq 1
+}
+
+function Get-RepoMirrorProcesses([string]$mirrorExe) {
+    $targetPath = [IO.Path]::GetFullPath($mirrorExe)
+    foreach ($candidate in @(Get-Process -Name "VR180Mirror" -ErrorAction SilentlyContinue)) {
+        try { $candidatePath = $candidate.Path } catch { $candidatePath = $null }
+        if (-not $candidatePath) {
+            if (Get-Process -Id $candidate.Id -ErrorAction SilentlyContinue) {
+                throw "Cannot verify the executable path for VR180Mirror PID $($candidate.Id). Stop it, rerun this launcher at the same privilege level, and try again."
+            }
+            continue
+        }
+        try { $candidatePath = [IO.Path]::GetFullPath($candidatePath) } catch {
+            throw "Cannot normalize the executable path for VR180Mirror PID $($candidate.Id). Stop it and try again."
+        }
+        if ($candidatePath -ieq $targetPath) { $candidate }
+    }
+}
+
+function Assert-RtssCaptureSafe([string]$repoRoot) {
+    $mirrorExe = Join-Path $repoRoot "bin\VR180Mirror.exe"
+
+    foreach ($mirrorProcess in (Get-RepoMirrorProcesses $mirrorExe)) {
+        try {
+            $rtssHook = $mirrorProcess.Modules |
+                Where-Object { $_.ModuleName -ieq "RTSSHooks64.dll" } |
+                Select-Object -First 1
+        } catch {
+            # Ignore a normal exit race. If the process is still alive, fail
+            # closed because its injected modules could not be verified.
+            if (Get-Process -Id $mirrorProcess.Id -ErrorAction SilentlyContinue) {
+                throw "Cannot verify whether repo VR180Mirror PID $($mirrorProcess.Id) has the RTSS hook loaded. Stop it, rerun this launcher at the same privilege level, and try again."
+            }
+            continue
+        }
+        if ($rtssHook) {
+            throw @"
+Repo VR180Mirror PID $($mirrorProcess.Id) already has RTSSHooks64.dll loaded. RTSS exclusions apply only when a process starts.
+Gracefully close that VR180Mirror process, confirm its RTSS profile uses Application detection level 'None', then rerun this launcher.
+"@
+        }
+    }
+
+    $rtssInjectors = @(Get-Process -Name "RTSS", "RTSSHooksLoader64", "RTSSHooksLoader" `
+        -ErrorAction SilentlyContinue)
+    if (-not $rtssInjectors) { return }
+
+    $programFilesX86 = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFilesX86)
+    if (-not $programFilesX86) { $programFilesX86 = $env:ProgramFiles }
+    $profilePath = Join-Path $programFilesX86 "RivaTuner Statistics Server\Profiles\VR180Mirror.exe.cfg"
+    if (-not (Test-RtssMirrorExclusion $profilePath)) {
+        throw @"
+RTSS or its hook loader is running without the required VR180Mirror exclusion. Its DXGI hook freezes OBS Game Capture on one frame.
+Either exit RTSS (and its hook loader) before rerunning, or add '$mirrorExe' in RTSS and set Application detection level to 'None'.
+Expected profile: '$profilePath'
+Expected exact setting under [Hooking]: EnableHooking=0
+RTSS can remain enabled for every other application.
+"@
+    }
+}
+
+Assert-RtssCaptureSafe $root
+
 # Our OBS may run elevated (scheduled task) - its command line is invisible to
 # non-admin WMI, so check the task state first.
 function Test-OurObs {
