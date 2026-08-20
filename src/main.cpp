@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <atomic>
 #include <thread>
+#include <mutex>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -294,6 +295,114 @@ struct VRState {
     ULONGLONG nextRefreshTick = 0;
 } vrs;
 
+// vrs.sys/vrs.comp are touched from both the render thread (vrAcquireMirror,
+// the new per-frame pose sample) and the I/O thread (connect/disconnect,
+// event pump) with no prior synchronization - vrDisconnect() nulls them out
+// via VR_Shutdown() while the render thread could be mid-call on the same
+// handles. Recursive because vrTryConnect/vrPump's event loop can call back
+// into vrDisconnect while already holding the lock.
+static std::recursive_mutex g_vrMx;
+
+// ----------------------------------------------------------------------------
+// Player HMD pose (world-lock stabilization): sampled once per presented
+// frame on the render thread (vrSamplePose, called from vrPumpRender), kept
+// in a small ring buffer, and flushed to bin\poses.json every ~200ms by the
+// I/O thread so the viewer can look up "the pose at capture time T" and
+// counter-rotate its dome by it. Timestamped in UTC ms (not QPC) because it
+// has to line up with MediaMTX's #EXT-X-PROGRAM-DATE-TIME, which is a wall
+// clock stamp.
+struct PoseSample { uint64_t tMs; float q[4]; };   // q = x,y,z,w
+static const int POSE_RING_CAP = 512;
+static const int POSE_PUBLISH_MAX = 250;   // ~3.5s at 72fps - plenty for the ~1s stream delay
+static PoseSample g_poseRing[POSE_RING_CAP];
+static int g_poseHead = 0;    // next write slot
+static int g_poseCount = 0;   // valid entries, caps at POSE_RING_CAP
+static std::mutex g_poseMx;
+
+static uint64_t nowUtcMs() {
+    FILETIME ft; GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER uli; uli.LowPart = ft.dwLowDateTime; uli.HighPart = ft.dwHighDateTime;
+    const uint64_t kEpochDiff100ns = 116444736000000000ULL;   // 1601 -> 1970, 100ns units
+    return (uli.QuadPart - kEpochDiff100ns) / 10000ULL;
+}
+
+// Shepperd's method: 3x3 rotation (from OpenVR's row-major HmdMatrix34_t,
+// translation column ignored) -> quaternion (x,y,z,w).
+static void poseQuatFromMatrix(const vr::HmdMatrix34_t& m, float q[4]) {
+    const float m00 = m.m[0][0], m01 = m.m[0][1], m02 = m.m[0][2];
+    const float m10 = m.m[1][0], m11 = m.m[1][1], m12 = m.m[1][2];
+    const float m20 = m.m[2][0], m21 = m.m[2][1], m22 = m.m[2][2];
+    const float tr = m00 + m11 + m22;
+    float qx, qy, qz, qw;
+    if (tr > 0.0f) {
+        float S = sqrtf(tr + 1.0f) * 2.0f;   // S = 4*qw
+        qw = 0.25f * S;
+        qx = (m21 - m12) / S;
+        qy = (m02 - m20) / S;
+        qz = (m10 - m01) / S;
+    } else if (m00 > m11 && m00 > m22) {
+        float S = sqrtf(1.0f + m00 - m11 - m22) * 2.0f;   // S = 4*qx
+        qw = (m21 - m12) / S;
+        qx = 0.25f * S;
+        qy = (m01 + m10) / S;
+        qz = (m02 + m20) / S;
+    } else if (m11 > m22) {
+        float S = sqrtf(1.0f + m11 - m00 - m22) * 2.0f;   // S = 4*qy
+        qw = (m02 - m20) / S;
+        qx = (m01 + m10) / S;
+        qy = 0.25f * S;
+        qz = (m12 + m21) / S;
+    } else {
+        float S = sqrtf(1.0f + m22 - m00 - m11) * 2.0f;   // S = 4*qz
+        qw = (m10 - m01) / S;
+        qx = (m02 + m20) / S;
+        qy = (m12 + m21) / S;
+        qz = 0.25f * S;
+    }
+    q[0] = qx; q[1] = qy; q[2] = qz; q[3] = qw;
+}
+
+static void poseRingPush(uint64_t tMs, const float q[4]) {
+    std::lock_guard<std::mutex> lk(g_poseMx);
+    g_poseRing[g_poseHead] = { tMs, { q[0], q[1], q[2], q[3] } };
+    g_poseHead = (g_poseHead + 1) % POSE_RING_CAP;
+    if (g_poseCount < POSE_RING_CAP) g_poseCount++;
+}
+
+// Atomic write (tmp + rename) so the viewer never reads a torn file - unlike
+// writeStatusFile()/mirror_status.json, which is a plain fopen/fprintf/fclose.
+static void writePosesFile() {
+    static char path[MAX_PATH] = {}, tmp[MAX_PATH] = {};
+    if (!path[0]) {
+        GetModuleFileNameA(nullptr, path, MAX_PATH);
+        char* slash = strrchr(path, '\\');
+        if (slash) strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "poses.json");
+        GetModuleFileNameA(nullptr, tmp, MAX_PATH);
+        char* slash2 = strrchr(tmp, '\\');
+        if (slash2) strcpy_s(slash2 + 1, MAX_PATH - (slash2 + 1 - tmp), "poses.json.tmp");
+    }
+    static PoseSample snap[POSE_PUBLISH_MAX];
+    int n;
+    int start;
+    {
+        std::lock_guard<std::mutex> lk(g_poseMx);
+        n = (g_poseCount < POSE_PUBLISH_MAX) ? g_poseCount : POSE_PUBLISH_MAX;
+        start = (g_poseHead - n + POSE_RING_CAP) % POSE_RING_CAP;
+        for (int i = 0; i < n; i++) snap[i] = g_poseRing[(start + i) % POSE_RING_CAP];
+    }
+    FILE* f = nullptr;
+    if (fopen_s(&f, tmp, "wb") != 0 || !f) return;
+    fprintf(f, "{\"poses\":[");
+    for (int i = 0; i < n; i++) {
+        fprintf(f, "%s{\"t\":%llu,\"q\":[%.6f,%.6f,%.6f,%.6f]}",
+            i ? "," : "", (unsigned long long)snap[i].tMs,
+            snap[i].q[0], snap[i].q[1], snap[i].q[2], snap[i].q[3]);
+    }
+    fprintf(f, "]}");
+    fclose(f);
+    MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING);
+}
+
 // Publish the active canvas spans for the viewer (bin\mirror_status.json,
 // served through the web server's /info) so the dome layer uses matching angles.
 static void writeStatusFile() {
@@ -351,6 +460,7 @@ static void vrReleaseMirror() {
 }
 
 static void vrDisconnect(const char* why) {
+    std::lock_guard<std::recursive_mutex> lk(g_vrMx);
     if (vrs.connected) logf("SteamVR disconnected (%s)", why);
     vrReleaseMirror();
     if (vrs.sys) vr::VR_Shutdown();
@@ -369,6 +479,7 @@ static void mat34ToHeadToEye(const vr::HmdMatrix34_t& m, float out9[9]) {
 }
 
 static void vrRefreshProjection() {
+    std::lock_guard<std::recursive_mutex> lk(g_vrMx);
     if (!vrs.sys) return;
     vrs.sys->GetProjectionRaw(vr::Eye_Left,  &vrs.projL[0], &vrs.projL[1], &vrs.projL[2], &vrs.projL[3]);
     vrs.sys->GetProjectionRaw(vr::Eye_Right, &vrs.projR[0], &vrs.projR[1], &vrs.projR[2], &vrs.projR[3]);
@@ -378,6 +489,7 @@ static void vrRefreshProjection() {
 }
 
 static bool vrAcquireMirror() {
+    std::lock_guard<std::recursive_mutex> lk(g_vrMx);
     if (!vrs.comp || vrs.haveMirror) return vrs.haveMirror;
     vr::EVRCompositorError e1 = vrs.comp->GetMirrorTextureD3D11(
         vr::Eye_Left, g.dev.Get(), (void**)&vrs.srvL);
@@ -411,6 +523,7 @@ static bool vrAcquireMirror() {
 static std::atomic<bool> g_wantMirror{false};
 
 static void vrTryConnect() {
+    std::lock_guard<std::recursive_mutex> lk(g_vrMx);
     ULONGLONG now = GetTickCount64();
     if (now < vrs.nextRetryTick) return;
     vrs.nextRetryTick = now + 3000;
@@ -450,16 +563,37 @@ static void vrTryConnect() {
     g_wantMirror.store(true, std::memory_order_relaxed);
 }
 
-// Render-thread half: only the mirror acquisition, which needs the D3D device.
+// The player's HMD pose, once per presented frame - the compositor's *render*
+// pose (what was actually used to render the mirror), not a freshly predicted
+// one, since the latter would describe a slightly different instant than the
+// frame we're capturing. GetLastPoseForTrackedDeviceIndex is safe to call from
+// a background-application process; WaitGetPoses is not (fails with
+// VRCompositorError_IsNotSceneApplication under VRApplication_Background).
+static void vrSamplePose() {
+    std::lock_guard<std::recursive_mutex> lk(g_vrMx);
+    if (!vrs.comp || !vrs.connected) return;
+    vr::TrackedDevicePose_t renderPose{}, gamePose{};
+    vr::EVRCompositorError e = vrs.comp->GetLastPoseForTrackedDeviceIndex(
+        vr::k_unTrackedDeviceIndex_Hmd, &renderPose, &gamePose);
+    if (e != vr::VRCompositorError_None || !renderPose.bPoseIsValid) return;
+    float q[4];
+    poseQuatFromMatrix(renderPose.mDeviceToAbsoluteTracking, q);
+    poseRingPush(nowUtcMs(), q);
+}
+
+// Render-thread half: mirror acquisition (needs the D3D device) and the
+// per-frame pose sample (needs to match this exact presented frame).
 static void vrPumpRender() {
     if (vrs.connected && !vrs.haveMirror && g_wantMirror.load(std::memory_order_relaxed)) {
         g_wantMirror.store(false, std::memory_order_relaxed);
         vrAcquireMirror();
     }
+    vrSamplePose();
 }
 
 // I/O-thread half: connect, events, projection refresh.
 static void vrPump() {
+    std::lock_guard<std::recursive_mutex> lk(g_vrMx);
     if (!vrs.connected) { vrTryConnect(); return; }
 
     vr::VREvent_t ev;
@@ -807,6 +941,7 @@ int main(int argc, char** argv) {
             vrPump();                       // connect / events / projection
             pollRuntimeFile();
             writeStatusFile();
+            writePosesFile();
 
             const ULONGLONG nowTick = GetTickCount64();
             if (nowTick - lastTick >= 5000) {

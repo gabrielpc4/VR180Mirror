@@ -15,6 +15,14 @@ let mp4 = null, decoder = null, cfg = null, offset = 0;
 let pending = [], outstanding = 0, lastDepthPost = 0;
 let credits = 0, bonus = 0;
 
+// PTS<->wall-clock anchor for the stabilization feature: MediaMTX stamps each
+// LL-HLS segment with #EXT-X-PROGRAM-DATE-TIME (confirmed in gohlslib's muxer:
+// DateTime: &seg.startNTP). Pairing that with the first sample's PTS after
+// this segment's data is appended gives "PTS -> wall clock" for free, without
+// guessing a fixed offset. Set right before appending a segment that carries
+// a PDT; consumed (and cleared) by the first onSamples call afterward.
+let pendingPdtMs = null;
+
 // Backlog control. Segments arrive as 1-second bursts, so the undecoded backlog
 // naturally sawtooths between ~0 and ~72 chunks; these thresholds sit above
 // that. If the display consumes slightly slower than the source produces (e.g.
@@ -49,6 +57,10 @@ function resetParser() {
   try { if (decoder && decoder.state !== "closed") decoder.close(); } catch (e) {}
   mp4 = null; decoder = null; cfg = null; offset = 0;
   pending = []; outstanding = 0; credits = INFLIGHT_CAP;
+  pendingPdtMs = null;
+  // the PTS epoch is about to restart from wherever the new session's first
+  // moof's tfdt says - any PTS->wall-clock mapping the page derived is stale
+  postMessage({ type: "pdtreset" });
 }
 
 function ensureFile() {
@@ -90,6 +102,11 @@ function ensureFile() {
   };
 
   mp4.onSamples = (id, user, samples) => {
+    if (pendingPdtMs !== null && samples.length) {
+      const s0 = samples[0];
+      postMessage({ type: "pdt", pdtMs: pendingPdtMs, ptsUs: Math.round(s0.cts * 1e6 / s0.timescale) });
+      pendingPdtMs = null;
+    }
     for (const s of samples) {
       pending.push({
         key: !!s.is_sync,
@@ -142,7 +159,7 @@ function drain() {
 // ---------------------------------------------------------------------------
 let fetcher = null;
 
-async function fetchFeed(url) {
+async function fetchFeed(url, pdtMs) {
   let resp;
   try {
     resp = await fetch(url, { cache: "no-store" });
@@ -154,11 +171,13 @@ async function fetchFeed(url) {
   ensureFile();
   buf.fileStart = offset;
   offset += buf.byteLength;
+  if (typeof pdtMs === "number") pendingPdtMs = pdtMs;
   try {
     mp4.appendBuffer(buf);
     mp4.flush();
   } catch (e) {
     log("append(" + buf.byteLength + "B): " + (e && e.message ? e.message : e));
+    pendingPdtMs = null;
     resetParser();                 // unusable parser: rebuild on the next init
     throw new Error("parser reset after append failure");
   }
@@ -168,6 +187,12 @@ async function fetchFeed(url) {
 function parsePlaylist(txt, baseUrl) {
   const lines = txt.split(/\r?\n/);
   const out = { mediaSeq: 0, initUri: null, segs: [] };
+  // MediaMTX stamps #EXT-X-PROGRAM-DATE-TIME per segment (see gohlslib's
+  // muxer_stream.go: DateTime: &seg.startNTP), previously discarded here.
+  // Carry it forward across segments (advanced by each EXTINF duration) in
+  // case a given muxer only repeats it on discontinuities rather than every
+  // segment - each seg gets a pdtMs either way, exact or duration-extrapolated.
+  let curPdt = null;
   for (let i = 0; i < lines.length; i++) {
     const l = lines[i].trim();
     if (l.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
@@ -175,10 +200,19 @@ function parsePlaylist(txt, baseUrl) {
     } else if (l.startsWith("#EXT-X-MAP:")) {
       const m = l.match(/URI="([^"]+)"/);
       if (m) out.initUri = new URL(m[1], baseUrl).href;
+    } else if (l.startsWith("#EXT-X-PROGRAM-DATE-TIME:")) {
+      const t = Date.parse(l.slice(l.indexOf(":") + 1));
+      if (!isNaN(t)) curPdt = t;
     } else if (l.startsWith("#EXTINF")) {
+      const durMatch = l.match(/#EXTINF:([\d.]+)/);
+      const durMs = durMatch ? Math.round(parseFloat(durMatch[1]) * 1000) : 1000;
       for (let j = i + 1; j < lines.length; j++) {
         const u = lines[j].trim();
-        if (u && !u.startsWith("#")) { out.segs.push(new URL(u, baseUrl).href); break; }
+        if (u && !u.startsWith("#")) {
+          out.segs.push({ url: new URL(u, baseUrl).href, pdtMs: curPdt });
+          if (curPdt != null) curPdt += durMs;
+          break;
+        }
       }
     }
   }
@@ -260,7 +294,7 @@ async function followStream(masterUrl) {
     for (let k = 0; k < pl.segs.length; k++) {
       const seq = pl.mediaSeq + k;
       if (seq >= nextSeq) {
-        await fetchFeed(pl.segs[k]);
+        await fetchFeed(pl.segs[k].url, pl.segs[k].pdtMs);
         nextSeq = seq + 1;
         got++;
       }

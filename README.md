@@ -115,22 +115,6 @@ The capture reads the **SteamVR compositor**, so the game must run through Steam
 - **Steam Link**: nothing to do (always SteamVR; set SteamVR as the OpenXR runtime if asked).
 - **Link cable / Air Link**: launch the game in SteamVR mode (OpenVR titles do this automatically).
 
-## Quest launcher app (recommended): `quest-app\VR180Spectator.apk`
-
-A tiny sideloaded 2D app for the spectator Quest — USB-cable only, matching the rest of the
-pipeline. It checks the adb-reverse tunnel every 2 s, shows PC/stream status (live, codec
-tracks), remembers three checkboxes — **Hard-lock view**, **Start muted**, **Full picture
-(no edge softening)** — and one WATCH button opens the WebXR viewer with everything
-pre-applied (one more click inside: Enter VR).
-
-- Install once: `adb install -r quest-app\VR180Spectator.apk` (or drag into SideQuest).
-  Appears under Library → Unknown Sources as "VR180 Spectator".
-- Rebuild: `quest-app\build-apk.ps1` (raw aapt2/d8/apksigner toolchain — no Gradle).
-- The "Full picture" toggle is live: the viewer posts it to `/settings`, the web server writes
-  `bin\runtime.json`, and VR180Mirror.exe applies it within a second (it removes the edge-fade
-  feather; any rounded corners that remain are the game's own lens mask — those pixels are never
-  rendered by the game and cannot be recovered).
-
 ## Spectator headset
 
 Plug the spectator Quest into a **USB 3.0** port (Developer Mode enabled), run
@@ -148,6 +132,13 @@ cadence (no 72-in-90 pulldown).
 **Hard-lock to player's view** checkbox glues the dome to the spectator's head so they always
 see the player's exact framing (intense! motion-sickness warning); unchecked (default) the dome
 is world-fixed and the spectator can look around the 180° canvas freely.
+
+**Stabilize to player's head (world-lock)** checkbox counter-rotates the dome by the player's
+own head movement, so a point in the game world stays put for the spectator instead of sliding
+around with the player's head - up to the edge of what the player actually rendered. Needs a
+one-time **Sync offset (ms)** calibration (also settable from the Console); see
+`docs/STABILIZATION.md` for the math, the calibration procedure, and known limits (rotation
+only - no compensation for the player's own movement).
 
 ## Control panel (`VR180Console.exe`)
 

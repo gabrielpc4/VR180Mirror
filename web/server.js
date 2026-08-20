@@ -82,6 +82,12 @@ function settings(req, res) {
         if (typeof body.renderScale === "number" && body.renderScale >= 1.0 && body.renderScale <= 2.0) {
           cur.renderScale = Math.round(body.renderScale * 100) / 100;
         }
+        if (typeof body.syncOffsetMs === "number" && body.syncOffsetMs >= 0 && body.syncOffsetMs <= 500) {
+          cur.syncOffsetMs = Math.round(body.syncOffsetMs);
+        }
+        if (typeof body.stabilize === "boolean") {
+          cur.stabilize = body.stabilize;
+        }
         fs.writeFileSync(RUNTIME_FILE, JSON.stringify(cur));
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(cur));
@@ -144,6 +150,21 @@ function handler(req, res) {
       try { fs.appendFileSync(path.join(ROOT, "client.log"), line + String.fromCharCode(10)); } catch (e) {}
       res.writeHead(204); res.end();
     });
+    return;
+  }
+  if (u.pathname === "/poses") {
+    // Player HMD pose history for the stabilization feature - published by
+    // VR180Mirror.exe (bin/poses.json, atomic tmp+rename write, ~200ms cadence).
+    // ?since=<ms> trims to samples newer than that UTC-ms timestamp, so the
+    // viewer only has to transfer what it doesn't already have.
+    const since = Number(u.searchParams.get("since")) || 0;
+    let poses = [];
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(ROOT, "..", "bin", "poses.json"), "utf8"));
+      poses = (raw.poses || []).filter((p) => p.t > since);
+    } catch (e) {}
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({ poses }));
     return;
   }
   if (u.pathname === "/devstats") {
