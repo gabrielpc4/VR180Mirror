@@ -91,6 +91,15 @@ function settings(req, res) {
         if (typeof body.dome === "boolean") {
           cur.dome = body.dome;
         }
+        if (typeof body.vibrance === "number" && body.vibrance >= 0 && body.vibrance <= 100) {
+          cur.vibrance = Math.round(body.vibrance);
+        }
+        if (typeof body.sharpening === "number" && body.sharpening >= 0 && body.sharpening <= 100) {
+          cur.sharpening = Math.round(body.sharpening);
+        }
+        if (body.colorProfile === "rec709" || body.colorProfile === "rec2020") {
+          cur.colorProfile = body.colorProfile;
+        }
         fs.writeFileSync(RUNTIME_FILE, JSON.stringify(cur));
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(cur));
@@ -176,6 +185,9 @@ function handler(req, res) {
         srcFps: spans.srcfps, gameFps: spans.gamefps,
         stabilization: spans.stabilization === 1,
         dome: spans.dome === 1,
+        vibrance: spans.vibrance,
+        sharpening: spans.sharpening,
+        colorProfile: spans.colorProfile,
         sourcePoseValid: spans.sourcePoseValid === 1,
         stabilizationCorrectionDeg: spans.stabilizationCorrectionDeg || 0,
         canvasW: spans.canvasW, canvasH: spans.canvasH, ...extra }));

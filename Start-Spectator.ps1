@@ -314,7 +314,7 @@ if (Get-OurProcess "mediamtx.exe" "VR180Mirror") {
 } else {
     Start-Process -FilePath "$root\tools\mediamtx\mediamtx.exe" `
         -ArgumentList "`"$root\tools\mediamtx\mediamtx.yml`"" `
-        -WorkingDirectory "$root\tools\mediamtx"
+        -WorkingDirectory "$root\tools\mediamtx" -WindowStyle Hidden
     Write-Host "MediaMTX started (RTMP ingest :1936, LL-HLS :9888)"
 }
 
@@ -325,7 +325,7 @@ if (Get-OurProcess "node.exe" "VR180Mirror\web\server.js") {
     $webArgs = @("`"$root\web\server.js`"")
     if ($Serial) { $webArgs += "--serial", $Serial }
     Start-Process -FilePath "node" -ArgumentList $webArgs `
-        -WorkingDirectory "$root\web"                      # visible console
+        -WorkingDirectory "$root\web" -WindowStyle Hidden
     Write-Host "Web server started (http :9080)"
 }
 

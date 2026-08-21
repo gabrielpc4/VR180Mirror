@@ -283,7 +283,16 @@ complete pipeline and launches the native spectator app automatically. Its toggl
 
 - **Image stabilization** enables or disables source-pose stabilization.
 - **VR180 dome** switches between the classic 180x180 dome and the sharper exact-FOV viewport.
-  It is deliberately reset to **off** whenever the panel opens.
+  It is **off by default** and remembers an explicit user choice.
+- **Color vibrance** is a live selective-saturation adjustment. It starts at **0%** to preserve
+  the captured SDR Rec.709/sRGB image. Virtual Desktop's similarly named option is a binary
+  Rec.709/Rec.2020 color-space choice, not a documented percentage saturation setting, so this
+  pipeline does not guess or silently retag the encoded video. Increase this slider by eye if
+  you prefer the more-vivid Virtual Desktop look.
+- **Color profile** selects **Rec.709 (reference)** or **Rec.2020 (VD-style)**. The latter
+  emulates Virtual Desktop's wider-gamut presentation in the PC shader while retaining safe,
+  correctly-signalled 8-bit SDR Rec.709 HEVC for OBS, MediaMTX, and the Quest decoder. It is
+  not HDR/Rec.2100 and does not restart the stream.
 - **Stop Everything** force-stops the headset client and closes the mirror, the dedicated OBS
   stream, MediaMTX, the web server, and the panel without an exit confirmation.
 

@@ -1,5 +1,5 @@
-# Stops only the VR180Mirror pipeline processes (matched by command line),
-# leaving any other OBS/MediaMTX/node instances on the system untouched.
+# Stops every matching VR180Mirror pipeline process, including duplicate/restarted
+# instances, while leaving unrelated OBS/MediaMTX/node processes untouched.
 param([string]$Serial = "")
 $ErrorActionPreference = "SilentlyContinue"
 
@@ -10,7 +10,13 @@ function Stop-Ours([string]$name, [string]$cmdLike) {
         ForEach-Object {
             Write-Host "Stopping $($_.Name) (pid $($_.ProcessId))"
             try {
-                Stop-Process -Id $_.ProcessId -Force -Confirm:$false -ErrorAction Stop
+                # /T includes any hidden console/child process left behind by a
+                # failed or repeated start. Fall back to Stop-Process if taskkill
+                # itself is unavailable.
+                & "$env:SystemRoot\System32\taskkill.exe" /PID $_.ProcessId /T /F | Out-Null
+                if ($LASTEXITCODE -ne 0 -and (Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue)) {
+                    Stop-Process -Id $_.ProcessId -Force -Confirm:$false -ErrorAction Stop
+                }
             } catch {
                 $script:failed = $true
             }
@@ -36,6 +42,9 @@ Stop-Ours "obs64.exe"       "--profile VR180Mirror"
 Stop-Ours "VR180Mirror.exe" "VR180Mirror"
 Stop-Ours "node.exe"        "VR180Mirror\web\server.js"
 Stop-Ours "mediamtx.exe"    "VR180Mirror"
+# An older shortcut may have launched the console supervisor directly. It is
+# part of this repo's process tree, so terminate every duplicate of it too.
+Stop-Ours "VR180Console.exe" "VR180Mirror"
 
 # Do not open a UAC or confirmation prompt during one-click shutdown. The
 # scheduled-task stop normally owns the elevated OBS process; report a failure

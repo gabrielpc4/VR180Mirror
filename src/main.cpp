@@ -80,6 +80,10 @@ struct Config {
     bool     fullDome = false;      // classic 180x180 dome; production FOV-fit stays default
     bool     stabilizationSelfTest = false;
     float    featherDeg  = 1.5f;
+    // Applied before OBS/NVENC, so the spectator receives these filtered pixels.
+    float    vibrance   = 0.0f;     // 0..100, selective saturation boost
+    float    sharpening = 0.0f;     // 0..100, experimental CAS-style detail recovery; off by default
+    bool     rec2020Profile = false; // emulate VD's wider-gamut profile on SDR output
     std::string dumpFrame;
     std::string poseTrace;
     std::string poseTraceCheck;
@@ -160,6 +164,31 @@ static void pollRuntimeFile() {
             }
         }
     }
+    auto readPercent = [&](const char* name, float& value, const char* label) {
+        const char* entry = strstr(buf, name);
+        if (!entry) return;
+        float parsed = -1.0f;
+        if (sscanf_s(entry + strlen(name), " : %f", &parsed) == 1 &&
+            parsed >= 0.0f && parsed <= 100.0f && value != parsed) {
+            value = parsed;
+            logf("runtime.json: %s -> %.0f%%", label, parsed);
+        }
+    };
+    readPercent("\"vibrance\"", g_cfg.vibrance, "color vibrance");
+    readPercent("\"sharpening\"", g_cfg.sharpening, "experimental CAS sharpening");
+    k = strstr(buf, "\"colorProfile\"");
+    if (k) {
+        const char* colon = strchr(k, ':');
+        if (colon) {
+            while (*++colon == ' ' || *colon == '\t' || *colon == '\"') {}
+            const bool rec2020 = strncmp(colon, "rec2020", 7) == 0;
+            const bool rec709 = strncmp(colon, "rec709", 6) == 0;
+            if ((rec2020 || rec709) && g_cfg.rec2020Profile != rec2020) {
+                g_cfg.rec2020Profile = rec2020;
+                logf("runtime.json: color profile -> %s", rec2020 ? "Rec.2020 (VD-style)" : "Rec.709 reference");
+            }
+        }
+    }
 }
 
 static void logf(const char* fmt, ...) {
@@ -225,6 +254,7 @@ cbuffer CB : register(b0) {
     float4 params1;           // x: flipV, y: ss taps (1|4), zw: output pixel in per-eye uv
     float4 params2;           // x: horizontal span (rad), y: vertical span (rad)
     float4 params3;           // x: Present counter (mod 4096), y: counter overlay enabled
+    float4 params4;           // x: vibrance 0..1, y: Rec.2020 profile, z: experimental CAS 0..1
 };
 
 static const float PI = 3.14159265358979f;
@@ -338,6 +368,67 @@ float4 applyFrameCounter(float2 e, float4 base) {
     return float4(lerp(base.rgb, marker, 0.97 * edge), 1.0);
 }
 
+Texture2D postTex : register(t2);
+
+float3 linearToSrgb(float3 c) {
+    c = max(c, 0.0);
+    return lerp(12.92 * c, 1.055 * pow(c, 1.0 / 2.4) - 0.055, step(0.0031308, c));
+}
+
+float3 srgbToLinear(float3 c) {
+    return lerp(c / 12.92, pow((c + 0.055) / 1.055, 2.4), step(0.04045, c));
+}
+
+// Virtual Desktop's legacy "Increase Color Vibrance" option selects a
+// Rec.2020 profile at final presentation. This stream remains correctly
+// signalled Rec.709 SDR for OBS/HEVC/Media3, so reproduce its appearance
+// safely here: interpret the source triplet as Rec.2020, then map it into the
+// Rec.709 output gamut. Neutrals remain neutral and chroma expands.
+float3 applyColorProfile(float3 linearColor) {
+    if (params4.y < 0.5) return linearColor;
+    const float3x3 rec2020ToRec709 = float3x3(
+        1.6605, -0.5876, -0.0728,
+       -0.1246,  1.1329, -0.0083,
+       -0.0182, -0.1006,  1.1187);
+    return saturate(mul(rec2020ToRec709, linearColor));
+}
+
+// Muted colours receive more of the boost than already-saturated colours.
+// The adjustment is display-referred, then returned to our linear intermediate.
+float3 applyVibrance(float3 linearColor) {
+    float amount = params4.x;
+    if (amount <= 0.0001) return linearColor;
+    float3 display = linearToSrgb(saturate(linearColor));
+    float hi = max(display.r, max(display.g, display.b));
+    float lo = min(display.r, min(display.g, display.b));
+    float saturation = hi - lo;
+    float luma = dot(display, float3(0.2126, 0.7152, 0.0722));
+    float boost = amount * lerp(0.65, 0.20, saturation);
+    display = lerp(luma.xxx, display, 1.0 + boost);
+    return srgbToLinear(saturate(display));
+}
+
+// Experimental, conservative CAS-style five-tap sharpening. The exact zero path returns before
+// sampling neighbours, preserving the clean reference pixels bit-for-bit through this stage.
+// It intentionally operates in the linear floating-point intermediate to avoid chroma halos from
+// per-channel display-space sharpening.
+float3 applyExperimentalCas(float2 uv, float3 center) {
+    float amount = params4.z;
+    if (amount <= 0.0001) return center;
+    float2 pixel = params1.zw;
+    float3 north = postTex.SampleLevel(samp, uv + float2(0, -pixel.y), 0).rgb;
+    float3 south = postTex.SampleLevel(samp, uv + float2(0,  pixel.y), 0).rgb;
+    float3 west  = postTex.SampleLevel(samp, uv + float2(-pixel.x, 0), 0).rgb;
+    float3 east  = postTex.SampleLevel(samp, uv + float2( pixel.x, 0), 0).rgb;
+    // Adaptive strength falls to zero around clipped highlights/shadows.
+    float3 mn = min(center, min(min(north, south), min(west, east)));
+    float3 mx = max(center, max(max(north, south), max(west, east)));
+    float adapt = saturate(min(min(mn.r, mn.g), mn.b) /
+                           max(0.0001, max(max(mx.r, mx.g), mx.b)));
+    float weight = -0.20 * amount * sqrt(adapt);
+    return saturate((center + weight * (north + south + west + east)) / (1.0 + 4.0 * weight));
+}
+
 float4 psmain(VSOut i) : SV_Target {
     bool rightHalf = i.uv.x >= 0.5;
     float2 e = float2(frac(i.uv.x * 2.0), i.uv.y);
@@ -346,6 +437,12 @@ float4 psmain(VSOut i) : SV_Target {
         : (useRight ? sampleEye(texR, tanR, (float3x3)h2eR, e)
                     : sampleEye(texL, tanL, (float3x3)h2eL, e));
     return applyFrameCounter(e, color);
+}
+
+float4 pspost(VSOut i) : SV_Target {
+    float3 color = postTex.SampleLevel(samp, i.uv, 0).rgb;
+    color = applyExperimentalCas(i.uv, color);
+    return float4(applyVibrance(applyColorProfile(color)), 1.0);
 }
 )HLSL";
 
@@ -358,6 +455,7 @@ struct CBData {
     float params1[4];
     float params2[4];
     float params3[4];
+    float params4[4];
 };
 
 // ----------------------------------------------------------------------------
@@ -369,8 +467,12 @@ struct Gfx {
     ComPtr<IDXGISwapChain1>        swap;
     ComPtr<ID3D11RenderTargetView> rtvUnorm;
     ComPtr<ID3D11RenderTargetView> rtvSrgb;
+    ComPtr<ID3D11Texture2D>         intermediate;
+    ComPtr<ID3D11RenderTargetView>  intermediateRtv;
+    ComPtr<ID3D11ShaderResourceView> intermediateSrv;
     ComPtr<ID3D11VertexShader>     vs;
-    ComPtr<ID3D11PixelShader>      ps;
+    ComPtr<ID3D11PixelShader>      psReproject;
+    ComPtr<ID3D11PixelShader>      psPost;
     ComPtr<ID3D11Buffer>           cb;
     ComPtr<ID3D11SamplerState>     sampler;
 } g;
@@ -410,7 +512,7 @@ static void writeStatusFile() {
     }
     FILE* f = nullptr;
     if (fopen_s(&f, path, "wb") == 0 && f) {
-        fprintf(f, "{\"hspan\":%.1f,\"vspan\":%.1f,\"sourceHspan\":%.1f,\"sourceVSpan\":%.1f,\"stabilizationOverscanDeg\":%.1f,\"live\":%d,\"srcfps\":%d,\"gamefps\":%d,\"canvasW\":%d,\"canvasH\":%d,\"oculusOpenHr\":%ld,\"oculusOpenStage\":%d,\"stabilization\":%d,\"dome\":%d,\"sourcePoseValid\":%d,\"stabilizationCorrectionDeg\":%.3f}",
+        fprintf(f, "{\"hspan\":%.1f,\"vspan\":%.1f,\"sourceHspan\":%.1f,\"sourceVSpan\":%.1f,\"stabilizationOverscanDeg\":%.1f,\"live\":%d,\"srcfps\":%d,\"gamefps\":%d,\"canvasW\":%d,\"canvasH\":%d,\"oculusOpenHr\":%ld,\"oculusOpenStage\":%d,\"stabilization\":%d,\"dome\":%d,\"vibrance\":%.0f,\"sharpening\":%.0f,\"colorProfile\":\"%s\",\"sourcePoseValid\":%d,\"stabilizationCorrectionDeg\":%.3f}",
             vrs.hSpanRad * 180.0f / 3.14159265f,
             vrs.vSpanRad * 180.0f / 3.14159265f,
             vrs.sourceHSpanRad * 180.0f / 3.14159265f,
@@ -426,6 +528,9 @@ static void writeStatusFile() {
             g_oculusOpenStage.load(std::memory_order_relaxed),
             g_cfg.stabilization ? 1 : 0,
             g_cfg.fullDome ? 1 : 0,
+            g_cfg.vibrance,
+            g_cfg.sharpening,
+            g_cfg.rec2020Profile ? "rec2020" : "rec709",
             g_sourcePoseValid.load(std::memory_order_relaxed),
             g_stabilizationCorrectionMilliDeg.load(std::memory_order_relaxed) / 1000.0);
         fclose(f);
@@ -1165,7 +1270,7 @@ static bool sourceIsLive() {
 // Rendering
 // ----------------------------------------------------------------------------
 static bool compileShaders() {
-    ComPtr<ID3DBlob> vsb, psb, err;
+    ComPtr<ID3DBlob> vsb, reprojectBlob, postBlob, err;
     if (FAILED(D3DCompile(g_shaderSrc, strlen(g_shaderSrc), "vr180", nullptr, nullptr,
         "vsmain", "vs_5_0", 0, 0, &vsb, &err))) {
         logf("VS compile failed: %s", err ? (const char*)err->GetBufferPointer() : "?");
@@ -1173,12 +1278,19 @@ static bool compileShaders() {
     }
     err.Reset();
     if (FAILED(D3DCompile(g_shaderSrc, strlen(g_shaderSrc), "vr180", nullptr, nullptr,
-        "psmain", "ps_5_0", 0, 0, &psb, &err))) {
+        "psmain", "ps_5_0", 0, 0, &reprojectBlob, &err))) {
         logf("PS compile failed: %s", err ? (const char*)err->GetBufferPointer() : "?");
         return false;
     }
+    err.Reset();
+    if (FAILED(D3DCompile(g_shaderSrc, strlen(g_shaderSrc), "vr180", nullptr, nullptr,
+        "pspost", "ps_5_0", 0, 0, &postBlob, &err))) {
+        logf("Post-process shader compile failed: %s", err ? (const char*)err->GetBufferPointer() : "?");
+        return false;
+    }
     if (FAILED(g.dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &g.vs))) return false;
-    if (FAILED(g.dev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &g.ps))) return false;
+    if (FAILED(g.dev->CreatePixelShader(reprojectBlob->GetBufferPointer(), reprojectBlob->GetBufferSize(), nullptr, &g.psReproject))) return false;
+    if (FAILED(g.dev->CreatePixelShader(postBlob->GetBufferPointer(), postBlob->GetBufferSize(), nullptr, &g.psPost))) return false;
     return true;
 }
 
@@ -1238,6 +1350,9 @@ static void renderFrame(double timeSec) {
     cb.params2[1] = vrs.vSpanRad;
     cb.params3[0] = static_cast<float>(g_presentCount.load(std::memory_order_relaxed) & 4095LL);
     cb.params3[1] = g_cfg.frameCounterTest ? 1.0f : 0.0f;
+    cb.params4[0] = g_cfg.vibrance / 100.0f;
+    cb.params4[1] = g_cfg.rec2020Profile ? 1.0f : 0.0f;
+    cb.params4[2] = g_cfg.sharpening / 100.0f;
 
     D3D11_MAPPED_SUBRESOURCE map;
     if (SUCCEEDED(g.ctx->Map(g.cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
@@ -1245,33 +1360,44 @@ static void renderFrame(double timeSec) {
         g.ctx->Unmap(g.cb.Get(), 0);
     }
 
-    // match output gamma handling to the mirror's colorspace: sRGB SRV decodes
-    // to linear on sample, so encode back via an sRGB RTV — net passthrough.
-    ID3D11RenderTargetView* rtv = (sourceFrame && !gridMode && sourceSrgb)
-        ? g.rtvSrgb.Get() : g.rtvUnorm.Get();
-
+    // First reproject into a linear intermediate. The post pass can then use a
+    // local pixel neighbourhood without sampling the source projection again.
+    // Final gamma handling remains the old exact passthrough behavior.
+    ID3D11RenderTargetView* intermediateRtv = g.intermediateRtv.Get();
     const float black[4] = { 0, 0, 0, 1 };
-    g.ctx->ClearRenderTargetView(rtv, black);
-    g.ctx->OMSetRenderTargets(1, &rtv, nullptr);
+    g.ctx->ClearRenderTargetView(intermediateRtv, black);
+    g.ctx->OMSetRenderTargets(1, &intermediateRtv, nullptr);
     D3D11_VIEWPORT vp{ 0, 0, (float)g_cfg.width, (float)g_cfg.height, 0, 1 };
     g.ctx->RSSetViewports(1, &vp);
     g.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g.ctx->IASetInputLayout(nullptr);
     g.ctx->VSSetShader(g.vs.Get(), nullptr, 0);
-    g.ctx->PSSetShader(g.ps.Get(), nullptr, 0);
-    ID3D11ShaderResourceView* srvs[2] = {
+    g.ctx->PSSetShader(g.psReproject.Get(), nullptr, 0);
+    ID3D11ShaderResourceView* sourceSrvs[2] = {
         g_cfg.oculusVam ? ocs.cacheSrvL.Get() : vrs.srvL,
         g_cfg.oculusVam ? ocs.cacheSrvR.Get() : vrs.srvR,
     };
-    g.ctx->PSSetShaderResources(0, 2, srvs);
+    g.ctx->PSSetShaderResources(0, 2, sourceSrvs);
     ID3D11SamplerState* ss[1] = { g.sampler.Get() };
     g.ctx->PSSetSamplers(0, 1, ss);
     ID3D11Buffer* cbs[1] = { g.cb.Get() };
     g.ctx->PSSetConstantBuffers(0, 1, cbs);
     g.ctx->Draw(3, 0);
+    ID3D11ShaderResourceView* sourceNulls[2] = { nullptr, nullptr };
+    g.ctx->PSSetShaderResources(0, 2, sourceNulls);
 
-    ID3D11ShaderResourceView* nulls[2] = { nullptr, nullptr };
-    g.ctx->PSSetShaderResources(0, 2, nulls);
+    // Match output gamma handling to the mirror's colorspace: sRGB SRV decoded
+    // to linear in the first pass, then this RTV encodes it back exactly once.
+    ID3D11RenderTargetView* rtv = (sourceFrame && !gridMode && sourceSrgb)
+        ? g.rtvSrgb.Get() : g.rtvUnorm.Get();
+    g.ctx->ClearRenderTargetView(rtv, black);
+    g.ctx->OMSetRenderTargets(1, &rtv, nullptr);
+    g.ctx->PSSetShader(g.psPost.Get(), nullptr, 0);
+    ID3D11ShaderResourceView* postSrv[1] = { g.intermediateSrv.Get() };
+    g.ctx->PSSetShaderResources(2, 1, postSrv);
+    g.ctx->Draw(3, 0);
+    ID3D11ShaderResourceView* postNull[1] = { nullptr };
+    g.ctx->PSSetShaderResources(2, 1, postNull);
 }
 
 static bool dumpBackbufferBMP(const char* path) {
@@ -1405,6 +1531,11 @@ int main(int argc, char** argv) {
     if (g_cfg.stabilizationSelfTest) return runStabilizationSelfTest() ? 0 : 1;
     if (!g_cfg.poseTraceCheck.empty()) return runPoseTraceCheck(g_cfg.poseTraceCheck.c_str()) ? 0 : 1;
 
+    // This is a GUI capture application. Keep its inherited console hidden even
+    // when launched directly by Windows or a shortcut; normal diagnostics go to
+    // bin\VR180Mirror.log and startup errors surface through the control UI.
+    if (HWND console = GetConsoleWindow()) ShowWindow(console, SW_HIDE);
+
     setDpiAware();
     setGpuPriority();
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
@@ -1489,6 +1620,25 @@ int main(int argc, char** argv) {
     g.dev->CreateRenderTargetView(back.Get(), &rd, &g.rtvUnorm);
     rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     g.dev->CreateRenderTargetView(back.Get(), &rd, &g.rtvSrgb);
+
+    // The color-profile pass uses a linear floating-point intermediate, so the
+    // neutral Rec.709/vibrance-0 path does not introduce an extra 8-bit round.
+    D3D11_TEXTURE2D_DESC intermediateDesc{};
+    intermediateDesc.Width = g_cfg.width;
+    intermediateDesc.Height = g_cfg.height;
+    intermediateDesc.MipLevels = 1;
+    intermediateDesc.ArraySize = 1;
+    intermediateDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    intermediateDesc.SampleDesc.Count = 1;
+    intermediateDesc.Usage = D3D11_USAGE_DEFAULT;
+    intermediateDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(g.dev->CreateTexture2D(&intermediateDesc, nullptr, &g.intermediate)) ||
+        FAILED(g.dev->CreateRenderTargetView(g.intermediate.Get(), nullptr, &g.intermediateRtv)) ||
+        FAILED(g.dev->CreateShaderResourceView(g.intermediate.Get(), nullptr, &g.intermediateSrv)) ||
+        !g.intermediateRtv || !g.intermediateSrv) {
+        logf("Could not create post-process intermediate (%dx%d)", g_cfg.width, g_cfg.height);
+        return 1;
+    }
 
     if (!compileShaders()) return 1;
 
