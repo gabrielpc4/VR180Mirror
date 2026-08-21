@@ -15,6 +15,7 @@
 #   .\Start-Spectator.ps1 -TestGrid    render calibration grid (no SteamVR needed)
 #   .\Start-Spectator.ps1 -NoOBS       start everything except OBS
 # =============================================================================
+[CmdletBinding()]
 param(
     [switch]$TestGrid,
     # Capture VaM's native Oculus submission through Virtual Desktop instead
@@ -36,8 +37,6 @@ param(
     [int]$MaxBitrate = 0,
     # source render rate as a multiple of the stream fps (see below)
     [double]$SourceFpsScale = 1.0,
-    # classic full-180 canvas (default is FOV-fit = sharper)
-    [switch]$VR180,
     # adb device serial to target when more than one Quest is plugged in over
     # USB (see `adb devices`); default picks the sole device if only one is attached
     [string]$Serial = "",
@@ -328,7 +327,6 @@ if ($activeMirror) {
     # the full 4096x2048 backbuffer on every present. Raise -SourceFpsScale if
     # held frames ever reappear.
     $mirrorArgs = @("--size","${canvasW}x${canvasH}","--fps","$([int]($fps * $SourceFpsScale))","--preview","1280")
-    if ($VR180) { $mirrorArgs += "--vr180" }
     if ($TestGrid) { $mirrorArgs += "--test-grid" }
     if ($OculusVaM) { $mirrorArgs += "--oculus-vam" }
     Start-Process -FilePath "$root\bin\VR180Mirror.exe" -ArgumentList $mirrorArgs `

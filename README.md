@@ -85,7 +85,7 @@ Or drive it from PowerShell directly:
 .\Start-Spectator.ps1 -Bitrate 100000     # lower bitrate (kbps)
 .\Start-Spectator.ps1 -Serial <adb-id>    # target a specific headset when more than one is plugged in
 .\Start-Spectator.ps1 -TestGrid           # same, but streams a calibration grid (no SteamVR needed)
-.\Start-Spectator.ps1 -OculusVaM -VR180  # VaM through Virtual Desktop's native Oculus runtime
+.\Start-Spectator.ps1 -OculusVaM          # VaM through Virtual Desktop's native Oculus runtime
 .\Connect-SpectatorUSB.ps1 [-Serial <id>] # (re-)establish the adb-reverse tunnel after a re-plug
 .\Stop-Spectator.ps1                      # stops only this pipeline's processes
 ```
@@ -117,7 +117,7 @@ retries the stream; the spectator can join/leave any time.
 For `D:\Games\VaM\1_22_0_3\VaM (Virtual Desktop).bat`, start the spectator stack first:
 
 ```powershell
-.\Start-Spectator.ps1 -OculusVaM -VR180 -Serial <spectator-adb-id>
+.\Start-Spectator.ps1 -OculusVaM -Serial <spectator-adb-id>
 ```
 
 Then launch the batch unchanged. It runs `VaM.exe -vrmode oculus`; `VR180Mirror` injects its
@@ -180,9 +180,9 @@ shortcut at a scheduled task, so it starts elevated without a UAC prompt every t
 
 ## What to expect
 
-- The canvas is fitted to the game's real FOV (~114°×116°) and the viewer's dome is built with
-  matching angles, so every pixel carries picture instead of black bars.
-  `-VR180` restores the classic full-180 canvas.
+- The canvas is always fitted to the game's real FOV (~114°×116°) and the viewer's dome is built
+  with matching angles, so every pixel carries picture instead of black bars. The old full-180
+  launch override was removed so a stale command cannot silently change scale or framing.
 - The view is head-locked to the **player's** head (that is the point!). Spectators sensitive to
   motion sickness should sit down.
 - SteamVR overlays/dashboard the player sees are included (it mirrors the compositor output).

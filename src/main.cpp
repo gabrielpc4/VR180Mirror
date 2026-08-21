@@ -76,7 +76,6 @@ struct Config {
     bool     swapEyes    = false;
     bool     topmost     = false;
     bool     supersample = true;   // 2x2 box taps: cleaner downsample of supersampled mirrors
-    bool     fitFov      = true;   // pack only the rendered FOV into the canvas (no black bars)
     bool     stabilization = false; // POC: source-pose rotational stabilization, default off
     bool     stabilizationSelfTest = false;
     float    featherDeg  = 1.5f;
@@ -425,7 +424,7 @@ static void computeSpans() {
     const float stabilizationReserve = 12.0f * PI_ / 180.0f;
     const float minimumSpan = 90.0f * PI_ / 180.0f;
     float sourceH = PI_, sourceV = PI_;
-    if (g_cfg.fitFov && vrs.connected) {
+    if (vrs.connected) {
         float maxH = 0.0f, maxV = 0.0f;
         const float* projs[2] = { vrs.projL, vrs.projR };
         for (const float* p : projs) {
@@ -448,7 +447,7 @@ static void computeSpans() {
             h * 180.0f / PI_, v * 180.0f / PI_,
             sourceH * 180.0f / PI_, sourceV * 180.0f / PI_,
             g_cfg.stabilization ? " (stabilization overscan)" :
-                ((g_cfg.fitFov && vrs.connected) ? " (FOV-fit)" : " (full 180)"));
+                (vrs.connected ? " (FOV-fit)" : " (waiting for source FOV)"));
     }
     // the status file is written by the I/O thread, never from the render loop
 }
@@ -1361,7 +1360,6 @@ int main(int argc, char** argv) {
         else if (a == "--swap-eyes") { g_cfg.swapEyes = true; }
         else if (a == "--topmost") { g_cfg.topmost = true; }
         else if (a == "--no-ss") { g_cfg.supersample = false; }
-        else if (a == "--vr180") { g_cfg.fitFov = false; }   // classic full-180 canvas
         else if (a == "--feather") { g_cfg.featherDeg = (float)atof(next()); }
         else if (a == "--dump-frame") { g_cfg.dumpFrame = next(); }
         else if (a == "--help" || a == "-h") {
@@ -1369,6 +1367,11 @@ int main(int argc, char** argv) {
                    "            [--stabilization] [--stabilization-self-test] [--pose-trace out.csv] [--pose-trace-check in.csv] [--flip-v] [--swap-eyes] [--feather deg] [--topmost]\n"
                    "            [--dump-frame out.bmp]\n");
             return 0;
+        }
+        else {
+            fprintf(stderr, "Unknown argument: %s\n", a.c_str());
+            fprintf(stderr, "Run VR180Mirror --help for supported options.\n");
+            return 2;
         }
     }
     g_cfg.width  = std::max(640,  g_cfg.width  & ~1);
@@ -1387,7 +1390,7 @@ int main(int argc, char** argv) {
     setGpuPriority();
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
     timeBeginPeriod(1);
-    computeSpans();   // publish initial (full-180) spans for the viewer
+    computeSpans();   // publish initial spans while waiting for the source FOV
 
     logf("VR180Mirror starting: %dx%d @ %d fps (SBS half 180 equirect, source=%s)",
         g_cfg.width, g_cfg.height, g_cfg.fps,
