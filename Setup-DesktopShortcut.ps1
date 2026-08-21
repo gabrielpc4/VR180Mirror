@@ -7,7 +7,7 @@ $desktop = [Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)
 $shortcutPath = Join-Path $desktop "$Name.lnk"
 $powershell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 $control = Join-Path $root "Spectator-Control.ps1"
-$icon = Join-Path $root "bin\VR180Mirror.exe"
+$icon = Join-Path $root "assets\vr-spectator-control.ico"
 
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($shortcutPath)
