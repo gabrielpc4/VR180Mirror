@@ -183,8 +183,8 @@ shortcut at a scheduled task, so it starts elevated without a UAC prompt every t
 - By default the canvas is fitted to the game's real FOV and the native spectator layer uses
   matching angles, so every pixel carries picture instead of black bars. The desktop panel's
   explicit VR180 dome toggle is the only supported way to expand this to 180°×180°.
-- The view is head-locked to the **player's** head (that is the point!). Spectators sensitive to
-  motion sickness should sit down.
+- The spectator dome is world-fixed, so the spectator can freely look around the captured canvas.
+  The VR180 dome toggle changes its angular span only; it never enables head lock.
 - SteamVR overlays/dashboard the player sees are included (it mirrors the compositor output).
 - When the player's headset is streamed (VD/Steam Link), SteamVR applies FOV culling during fast
   head turns — brief black wedges at the edges of the mirrored image are normal and not a bug.
