@@ -104,6 +104,7 @@ static std::atomic<int> g_sourcePoseValid{0};
 static std::atomic<int> g_stabilizationCorrectionMilliDeg{0};
 static bool g_tearing = false;   // swapchain created with ALLOW_TEARING
 static bool sourceIsLive();
+static void computeSpans();
 static void pollRuntimeFile() {
     static char path[MAX_PATH] = {};
     if (!path[0]) {
@@ -140,6 +141,7 @@ static void pollRuntimeFile() {
             const bool disabled = strncmp(colon, "false", 5) == 0;
             if ((enabled || disabled) && g_cfg.stabilization != enabled) {
                 g_cfg.stabilization = enabled;
+                computeSpans();
                 logf("runtime.json: stabilization -> %s", enabled ? "on" : "off");
             }
         }
@@ -375,6 +377,8 @@ struct VRState {
     bool  connected = false;
     bool  haveMirror = false;
     uint32_t mirrorW = 0, mirrorH = 0;   // source size, for the sampling decision
+    float sourceHSpanRad = 3.14159265f;   // full valid source coverage
+    float sourceVSpanRad = 3.14159265f;
     float hSpanRad = 3.14159265f;   // canvas angular coverage (FOV-fit mode)
     float vSpanRad = 3.14159265f;
     ULONGLONG nextRetryTick = 0;
@@ -392,9 +396,12 @@ static void writeStatusFile() {
     }
     FILE* f = nullptr;
     if (fopen_s(&f, path, "wb") == 0 && f) {
-        fprintf(f, "{\"hspan\":%.1f,\"vspan\":%.1f,\"live\":%d,\"srcfps\":%d,\"gamefps\":%d,\"canvasW\":%d,\"canvasH\":%d,\"oculusOpenHr\":%ld,\"oculusOpenStage\":%d,\"stabilization\":%d,\"sourcePoseValid\":%d,\"stabilizationCorrectionDeg\":%.3f}",
+        fprintf(f, "{\"hspan\":%.1f,\"vspan\":%.1f,\"sourceHspan\":%.1f,\"sourceVspan\":%.1f,\"stabilizationOverscanDeg\":%.1f,\"live\":%d,\"srcfps\":%d,\"gamefps\":%d,\"canvasW\":%d,\"canvasH\":%d,\"oculusOpenHr\":%ld,\"oculusOpenStage\":%d,\"stabilization\":%d,\"sourcePoseValid\":%d,\"stabilizationCorrectionDeg\":%.3f}",
             vrs.hSpanRad * 180.0f / 3.14159265f,
             vrs.vSpanRad * 180.0f / 3.14159265f,
+            vrs.sourceHSpanRad * 180.0f / 3.14159265f,
+            vrs.sourceVSpanRad * 180.0f / 3.14159265f,
+            g_cfg.stabilization ? 12.0f : 0.0f,
             sourceIsLive() ? 1 : 0,
             // srcfps is the fixed canvas/encoder cadence that the Quest
             // contract consumes. gamefps separately exposes native game-frame
@@ -415,7 +422,9 @@ static void writeStatusFile() {
 // player-visible viewport. The spectator compositor receives these same angles.
 static void computeSpans() {
     const float PI_ = 3.14159265f;
-    float h = PI_, v = PI_;
+    const float stabilizationReserve = 12.0f * PI_ / 180.0f;
+    const float minimumSpan = 90.0f * PI_ / 180.0f;
+    float sourceH = PI_, sourceV = PI_;
     if (g_cfg.fitFov && vrs.connected) {
         float maxH = 0.0f, maxV = 0.0f;
         const float* projs[2] = { vrs.projL, vrs.projR };
@@ -423,14 +432,23 @@ static void computeSpans() {
             maxH = std::max(maxH, std::max(fabsf(atanf(p[0])), fabsf(atanf(p[1]))));
             maxV = std::max(maxV, std::max(fabsf(atanf(p[2])), fabsf(atanf(p[3]))));
         }
-        h = std::min(PI_, 2.0f * maxH);
-        v = std::min(PI_, 2.0f * maxV);
+        sourceH = std::min(PI_, 2.0f * maxH);
+        sourceV = std::min(PI_, 2.0f * maxV);
     }
+    const float h = g_cfg.stabilization
+        ? std::max(minimumSpan, sourceH - stabilizationReserve) : sourceH;
+    const float v = g_cfg.stabilization
+        ? std::max(minimumSpan, sourceV - stabilizationReserve) : sourceV;
+    vrs.sourceHSpanRad = sourceH;
+    vrs.sourceVSpanRad = sourceV;
     if (fabsf(h - vrs.hSpanRad) > 0.002f || fabsf(v - vrs.vSpanRad) > 0.002f) {
         vrs.hSpanRad = h;
         vrs.vSpanRad = v;
-        logf("canvas span: %.1f x %.1f deg%s", h * 180.0f / PI_, v * 180.0f / PI_,
-            (g_cfg.fitFov && vrs.connected) ? " (FOV-fit)" : " (full 180)");
+        logf("canvas span: %.1f x %.1f deg from %.1f x %.1f source%s",
+            h * 180.0f / PI_, v * 180.0f / PI_,
+            sourceH * 180.0f / PI_, sourceV * 180.0f / PI_,
+            g_cfg.stabilization ? " (stabilization overscan)" :
+                ((g_cfg.fitFov && vrs.connected) ? " (FOV-fit)" : " (full 180)"));
     }
     // the status file is written by the I/O thread, never from the render loop
 }
@@ -671,11 +689,70 @@ static void quatToMatrix(const Quaternion& q, float out[9]) {
     out[6]=2.0f*(xz-wy);      out[7]=2.0f*(yz+wx);      out[8]=1.0f-2.0f*(xx+yy);
 }
 
+static Quaternion matrix34ToQuaternion(const vr::HmdMatrix34_t& m) {
+    const float trace = m.m[0][0] + m.m[1][1] + m.m[2][2];
+    Quaternion q{};
+    if (trace > 0.0f) {
+        const float s = sqrtf(trace + 1.0f) * 2.0f;
+        q.w = 0.25f * s;
+        q.x = (m.m[2][1] - m.m[1][2]) / s;
+        q.y = (m.m[0][2] - m.m[2][0]) / s;
+        q.z = (m.m[1][0] - m.m[0][1]) / s;
+    } else if (m.m[0][0] > m.m[1][1] && m.m[0][0] > m.m[2][2]) {
+        const float s = sqrtf(1.0f + m.m[0][0] - m.m[1][1] - m.m[2][2]) * 2.0f;
+        q.w = (m.m[2][1] - m.m[1][2]) / s;
+        q.x = 0.25f * s;
+        q.y = (m.m[0][1] + m.m[1][0]) / s;
+        q.z = (m.m[0][2] + m.m[2][0]) / s;
+    } else if (m.m[1][1] > m.m[2][2]) {
+        const float s = sqrtf(1.0f + m.m[1][1] - m.m[0][0] - m.m[2][2]) * 2.0f;
+        q.w = (m.m[0][2] - m.m[2][0]) / s;
+        q.x = (m.m[0][1] + m.m[1][0]) / s;
+        q.y = 0.25f * s;
+        q.z = (m.m[1][2] + m.m[2][1]) / s;
+    } else {
+        const float s = sqrtf(1.0f + m.m[2][2] - m.m[0][0] - m.m[1][1]) * 2.0f;
+        q.w = (m.m[1][0] - m.m[0][1]) / s;
+        q.x = (m.m[0][2] + m.m[2][0]) / s;
+        q.y = (m.m[1][2] + m.m[2][1]) / s;
+        q.z = 0.25f * s;
+    }
+    return quatNormalize(q);
+}
+
+static void multiply3x3(const float a[9], const float b[9], float out[9]) {
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            out[row * 3 + col] =
+                a[row * 3 + 0] * b[0 * 3 + col] +
+                a[row * 3 + 1] * b[1 * 3 + col] +
+                a[row * 3 + 2] * b[2 * 3 + col];
+        }
+    }
+}
+
+static SourcePoseFrame querySteamVrRenderPose() {
+    SourcePoseFrame frame{};
+    frame.serial = static_cast<uint64_t>(
+        g_presentCount.load(std::memory_order_relaxed) + 1);
+    if (!vrs.comp || !vrs.connected || !vrs.haveMirror) return frame;
+    vr::TrackedDevicePose_t renderPose{}, gamePose{};
+    const vr::EVRCompositorError result = vrs.comp->GetLastPoseForTrackedDeviceIndex(
+        vr::k_unTrackedDeviceIndex_Hmd, &renderPose, &gamePose);
+    if (result != vr::VRCompositorError_None || !renderPose.bPoseIsValid ||
+        !renderPose.bDeviceIsConnected) return frame;
+    frame.orientation = matrix34ToQuaternion(renderPose.mDeviceToAbsoluteTracking);
+    frame.valid = true;
+    return frame;
+}
+
 // A bounded first-order reference pose is deliberately conservative: it
 // attenuates involuntary motion while following a deliberate turn before the
 // source FOV can run out of coverage.  It is disabled by default and resets
 // exactly on every toggle/off/pose discontinuity.
 struct PoseStabilizer {
+    static constexpr float kMaximumCorrectionDegrees = 5.0f;
+    static constexpr float kReferenceFollowSeconds = 1.40f;
     Quaternion reference{};
     Quaternion source{};
     uint64_t lastSerial = 0;
@@ -696,14 +773,21 @@ struct PoseStabilizer {
         }
         if (frame.serial != lastSerial) {
             const float dt = std::clamp(float(now - lastTick) / 1000.0f, 0.0f, 0.10f);
-            // 0.85 s reference-follow time lets short natural motion settle,
-            // without turning an intentional head turn into a long lag.
-            const float follow = 1.0f - expf(-dt / 0.85f);
+            // The correction reacts immediately, while this deliberately slow
+            // reference follows intentional turns. This is the stabilizer's
+            // allowed view lag; it suppresses natural head motion without
+            // delaying the encoded frame queue.
+            const float follow = 1.0f - expf(-dt / kReferenceFollowSeconds);
             reference = quatSlerp(reference, current, follow);
-            // Never hold more than 12 degrees away from the source image;
-            // beyond that, smoothly bring the reference along to preserve FOV.
+            // The stabilized viewport reserves six degrees on every edge.
+            // Keep one degree of safety for asymmetric eye projections and
+            // interpolation so the shader never samples outside real content.
             const float residual = quatAngleDeg(reference, current);
-            if (residual > 12.0f) reference = quatSlerp(reference, current, (residual - 12.0f) / residual);
+            if (residual > kMaximumCorrectionDegrees) {
+                reference = quatSlerp(
+                    reference, current,
+                    (residual - kMaximumCorrectionDegrees) / residual);
+            }
             source = current; lastSerial = frame.serial; lastTick = now;
         }
         const float correction = quatAngleDeg(reference, source);
@@ -739,8 +823,8 @@ static bool runStabilizationSelfTest() {
     float off[9] = {}; poc.headToSource(off);
     const bool identity = fabsf(off[0]-1.0f) < 0.0001f && fabsf(off[4]-1.0f) < 0.0001f &&
         fabsf(off[8]-1.0f) < 0.0001f && fabsf(off[1]) < 0.0001f && fabsf(off[2]) < 0.0001f;
-    const bool pass = smallCorrection > 4.5f && smallCorrection < 5.1f &&
-        largeCorrection <= 12.01f && identity;
+    const bool pass = smallCorrection > 4.5f && smallCorrection <= 5.01f &&
+        largeCorrection <= 5.01f && identity;
     logf("STABILIZATION_SELF_TEST %s small=%.3fdeg large=%.3fdeg identityOff=%d",
         pass ? "PASS" : "FAIL", smallCorrection, largeCorrection, identity ? 1 : 0);
     return pass;
@@ -785,8 +869,8 @@ static bool runPoseTraceCheck(const char* path) {
         ++samples;
     }
     fclose(f);
-    const bool pass = samples >= 2 && maxCorrectionDeg <= 12.01f;
-    logf("POSE_TRACE_CHECK %s samples=%llu maxStepDeg=%.3f maxCorrectionDeg=%.3f boundDeg=12.000 path=%s",
+    const bool pass = samples >= 2 && maxCorrectionDeg <= 5.01f;
+    logf("POSE_TRACE_CHECK %s samples=%llu maxStepDeg=%.3f maxCorrectionDeg=%.3f boundDeg=5.000 path=%s",
         pass ? "PASS" : "FAIL", static_cast<unsigned long long>(samples), maxStepDeg, maxCorrectionDeg, path);
     return pass;
 }
@@ -1099,15 +1183,22 @@ static void renderFrame(double timeSec) {
         out16[8]=r9[6]; out16[9]=r9[7]; out16[10]=r9[8];
         out16[15]=1.0f;
     };
+    const SourcePoseFrame stabilizationPose = g_cfg.oculusVam
+        ? ocs.pose : querySteamVrRenderPose();
+    g_stabilizer.consume(stabilizationPose, g_cfg.stabilization);
+    float correction[9] = {};
+    g_stabilizer.headToSource(correction);
     if (g_cfg.oculusVam) {
-        g_stabilizer.consume(ocs.pose, g_cfg.stabilization);
-        float stabilized[9] = {};
-        g_stabilizer.headToSource(stabilized);
-        pack(stabilized, cb.h2eL);
-        pack(stabilized, cb.h2eR);
+        pack(correction, cb.h2eL);
+        pack(correction, cb.h2eR);
     } else {
-        pack(vrs.rotL, cb.h2eL);
-        pack(vrs.rotR, cb.h2eR);
+        // SteamVR mirror projection is eye-relative. Apply the stabilization
+        // in head space first, then retain each eye's original cant transform.
+        float correctedL[9] = {}, correctedR[9] = {};
+        multiply3x3(vrs.rotL, correction, correctedL);
+        multiply3x3(vrs.rotR, correction, correctedR);
+        pack(correctedL, cb.h2eL);
+        pack(correctedR, cb.h2eR);
     }
     bool gridMode = g_cfg.testGrid || !sourceFrame;
     cb.params0[0] = tanf(g_cfg.featherDeg * 3.14159265f / 180.0f);
@@ -1301,8 +1392,10 @@ int main(int argc, char** argv) {
     logf("VR180Mirror starting: %dx%d @ %d fps (SBS half 180 equirect, source=%s)",
         g_cfg.width, g_cfg.height, g_cfg.fps,
         g_cfg.oculusVam ? "VaM Oculus/Virtual Desktop" : "SteamVR");
-    logf("Source-pose stabilization: %s%s", g_cfg.stabilization ? "ON (POC)" : "OFF",
-        g_cfg.oculusVam ? "; direct Oculus RenderPose transport" : "; unavailable on SteamVR mirror POC");
+    logf("Source-pose stabilization: %s; pose=%s overscan=%s correctionLimit=5.0deg",
+        g_cfg.stabilization ? "ON" : "OFF",
+        g_cfg.oculusVam ? "direct Oculus RenderPose" : "SteamVR compositor RenderPose",
+        g_cfg.stabilization ? "12.0deg total" : "off");
 
     // --- window ---
     WNDCLASSW wc{};

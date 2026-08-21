@@ -166,7 +166,10 @@ function handler(req, res) {
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       res.end(JSON.stringify({ app: "vr180mirror", lanIp, stream: STREAM_PATH,
         httpPort: HTTP_PORT,
-        hspan: spans.hspan, vspan: spans.vspan, mirrorLive: spans.live === 1,
+        hspan: spans.hspan, vspan: spans.vspan,
+        sourceHspan: spans.sourceHspan, sourceVspan: spans.sourceVspan,
+        stabilizationOverscanDeg: spans.stabilizationOverscanDeg || 0,
+        mirrorLive: spans.live === 1,
         srcFps: spans.srcfps, gameFps: spans.gamefps,
         stabilization: spans.stabilization === 1,
         sourcePoseValid: spans.sourcePoseValid === 1,

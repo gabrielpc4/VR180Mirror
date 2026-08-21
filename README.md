@@ -259,28 +259,35 @@ Ports used (all loopback-only, reached via the adb-reverse USB tunnel): 9080 (we
 .\tools\build-console.ps1  # rebuilds tools\VR180Console.exe (in-box csc.exe, no SDK needed)
 ```
 
-## Source-pose stabilization POC
+## Source-pose stabilization
 
-The optional POC stabilizes small-to-medium *source headset* rotation in the
-PC reprojection stage. It is **off by default** and currently applies to the
-direct VaM/Virtual Desktop Oculus path, where every submitted texture pair
-carries its matching LibOVR `RenderPose`.
+The optional stabilizer suppresses small-to-medium *source headset* rotation
+in the PC reprojection stage. It is **off by default**. SteamVR uses the
+compositor's nonblocking HMD render pose on every 72-Hz output frame; the
+direct VaM/Virtual Desktop Oculus path uses each submitted texture pair's
+matching LibOVR `RenderPose`.
 
-Turn it on or off while the pipeline is live; neither action restarts VaM,
-OBS, MediaMTX, or the spectator:
+Turn it on or off while the pipeline is live. VaM, OBS, MediaMTX, and the
+OpenXR session stay alive; the native spectator briefly hides and cleanly
+rebinds its decoder layer because the angular contract changes:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:9080/settings -Method Post -ContentType application/json -Body '{"stabilization":true}'
 Invoke-RestMethod http://127.0.0.1:9080/settings -Method Post -ContentType application/json -Body '{"stabilization":false}'
 ```
 
-`/info` reports the current mode, whether a source pose is valid, and the
-bounded correction angle. Use `--pose-trace C:\path\head-pose.csv` on the
+When enabled, the displayed viewport reserves 12 degrees of the full source
+coverage (six degrees per edge). The filter counter-rotates immediately,
+slowly follows deliberate turns, and limits correction to 5 degrees so it
+cannot expose pixels outside the overscan. `/info` reports displayed/source
+spans, overscan, pose validity, and the bounded correction angle.
+
+Use `--pose-trace C:\path\head-pose.csv` on the
 mirror to record synchronized, real submitted poses for later off/on analysis.
 Run `VR180Mirror.exe --pose-trace-check C:\path\head-pose.csv` to replay the
 same bounded filter offline and report its maximum observed pose step and
 correction; it can read an active trace without interrupting the mirror.
-The POC uses rotational stabilization only; it never invents positional depth
+The stabilizer uses rotation only; it never invents positional depth
 or changes the 6144x3264/72-Hz stream contract.
 
 ## Considering a native OpenXR client
