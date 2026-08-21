@@ -68,6 +68,9 @@ struct Config {
     int      fps         = 60;
     int      previewW    = 1440;
     bool     testGrid    = false;
+    // Temporary visual transport test: a 12-bit counter overlay changes on
+    // every mirror Present and can be decoded from a 72 fps recording.
+    bool     frameCounterTest = false;
     bool     oculusVam  = false;  // direct Oculus/Virtual Desktop eye capture
     bool     flipV       = false;
     bool     swapEyes    = false;
@@ -205,6 +208,7 @@ cbuffer CB : register(b0) {
     float4 params0;           // x: feather (tangent units), y: gridMode, z: time s, w: swapEyes
     float4 params1;           // x: flipV, y: ss taps (1|4), zw: output pixel in per-eye uv
     float4 params2;           // x: horizontal span (rad), y: vertical span (rad)
+    float4 params3;           // x: Present counter (mod 4096), y: counter overlay enabled
 };
 
 static const float PI = 3.14159265358979f;
@@ -302,13 +306,30 @@ float4 grid(float2 e, bool isRight) {
     return float4(col, 1.0);
 }
 
+// A 12-cell high-contrast binary counter in the upper-middle of each eye.
+// It changes every VR180Mirror Present, so a 72 fps recording can determine
+// whether every delivered frame is unique without relying on game motion.
+float4 applyFrameCounter(float2 e, float4 base) {
+    if (params3.y < 0.5 || e.x < 0.30 || e.x >= 0.70 || e.y < 0.05 || e.y >= 0.12)
+        return base;
+    uint bit = min((uint)((e.x - 0.30) / (0.40 / 12.0)), 11U);
+    uint counter = (uint)params3.x;
+    bool on = ((counter >> bit) & 1U) != 0U;
+    // Four repeated rows keep each bit readily legible after HEVC compression.
+    float stripe = frac((e.y - 0.05) / 0.0175);
+    float edge = smoothstep(0.03, 0.08, stripe) * (1.0 - smoothstep(0.92, 0.97, stripe));
+    float3 marker = on ? float3(1.0, 1.0, 1.0) : float3(0.0, 0.0, 0.0);
+    return float4(lerp(base.rgb, marker, 0.97 * edge), 1.0);
+}
+
 float4 psmain(VSOut i) : SV_Target {
     bool rightHalf = i.uv.x >= 0.5;
     float2 e = float2(frac(i.uv.x * 2.0), i.uv.y);
     bool useRight = (params0.w > 0.5) ? !rightHalf : rightHalf;
-    if (params0.y > 0.5) return grid(e, useRight);
-    if (useRight) return sampleEye(texR, tanR, (float3x3)h2eR, e);
-    return sampleEye(texL, tanL, (float3x3)h2eL, e);
+    float4 color = params0.y > 0.5 ? grid(e, useRight)
+        : (useRight ? sampleEye(texR, tanR, (float3x3)h2eR, e)
+                    : sampleEye(texL, tanL, (float3x3)h2eL, e));
+    return applyFrameCounter(e, color);
 }
 )HLSL";
 
@@ -320,6 +341,7 @@ struct CBData {
     float params0[4];
     float params1[4];
     float params2[4];
+    float params3[4];
 };
 
 // ----------------------------------------------------------------------------
@@ -388,8 +410,9 @@ static void writeStatusFile() {
     }
 }
 
-// FOV-fit: size the canvas span to the union of both eyes' frustums (relative
-// to head-forward) plus a small margin, so no canvas width is spent on black.
+// FOV-fit: size the canvas span to the exact union of both eyes' frustums
+// (relative to head-forward), so every output pixel contributes to the
+// player-visible viewport. The spectator compositor receives these same angles.
 static void computeSpans() {
     const float PI_ = 3.14159265f;
     float h = PI_, v = PI_;
@@ -400,9 +423,8 @@ static void computeSpans() {
             maxH = std::max(maxH, std::max(fabsf(atanf(p[0])), fabsf(atanf(p[1]))));
             maxV = std::max(maxV, std::max(fabsf(atanf(p[2])), fabsf(atanf(p[3]))));
         }
-        const float margin = 6.0f * PI_ / 180.0f;
-        h = std::min(PI_, 2.0f * maxH + margin);
-        v = std::min(PI_, 2.0f * maxV + margin);
+        h = std::min(PI_, 2.0f * maxH);
+        v = std::min(PI_, 2.0f * maxV);
     }
     if (fabsf(h - vrs.hSpanRad) > 0.002f || fabsf(v - vrs.vSpanRad) > 0.002f) {
         vrs.hSpanRad = h;
@@ -1105,6 +1127,8 @@ static void renderFrame(double timeSec) {
     cb.params1[3] = 1.0f / g_cfg.height;
     cb.params2[0] = vrs.hSpanRad;
     cb.params2[1] = vrs.vSpanRad;
+    cb.params3[0] = static_cast<float>(g_presentCount.load(std::memory_order_relaxed) & 4095LL);
+    cb.params3[1] = g_cfg.frameCounterTest ? 1.0f : 0.0f;
 
     D3D11_MAPPED_SUBRESOURCE map;
     if (SUCCEEDED(g.ctx->Map(g.cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
@@ -1236,6 +1260,7 @@ int main(int argc, char** argv) {
         else if (a == "--fps") { g_cfg.fps = atoi(next()); }
         else if (a == "--preview") { g_cfg.previewW = atoi(next()); }
         else if (a == "--test-grid") { g_cfg.testGrid = true; }
+        else if (a == "--frame-counter-test") { g_cfg.frameCounterTest = true; }
         else if (a == "--oculus-vam") { g_cfg.oculusVam = true; }
         else if (a == "--stabilization") { g_cfg.stabilization = true; }
         else if (a == "--stabilization-self-test") { g_cfg.stabilizationSelfTest = true; }
@@ -1249,7 +1274,7 @@ int main(int argc, char** argv) {
         else if (a == "--feather") { g_cfg.featherDeg = (float)atof(next()); }
         else if (a == "--dump-frame") { g_cfg.dumpFrame = next(); }
         else if (a == "--help" || a == "-h") {
-            printf("VR180Mirror [--size WxH] [--fps N] [--preview W] [--test-grid] [--oculus-vam]\n"
+            printf("VR180Mirror [--size WxH] [--fps N] [--preview W] [--test-grid] [--frame-counter-test] [--oculus-vam]\n"
                    "            [--stabilization] [--stabilization-self-test] [--pose-trace out.csv] [--pose-trace-check in.csv] [--flip-v] [--swap-eyes] [--feather deg] [--topmost]\n"
                    "            [--dump-frame out.bmp]\n");
             return 0;
