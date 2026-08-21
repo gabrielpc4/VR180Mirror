@@ -37,6 +37,11 @@ param(
     [int]$MaxBitrate = 0,
     # source render rate as a multiple of the stream fps (see below)
     [double]$SourceFpsScale = 1.0,
+    # Strong source-pose stabilization. The desktop control panel enables this
+    # by default; direct script launches remain explicit.
+    [switch]$Stabilization,
+    # Classic 180x180 dome. Off by default because exact FOV-fit is sharper.
+    [switch]$VR180Dome,
     # adb device serial to target when more than one Quest is plugged in over
     # USB (see `adb devices`); default picks the sole device if only one is attached
     [string]$Serial = "",
@@ -46,6 +51,21 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
+
+# Establish deterministic runtime defaults before the mirror starts. The same
+# file is watched live, so the desktop UI can change either option later.
+$runtimePath = Join-Path $root "bin\runtime.json"
+$runtime = @{}
+if (Test-Path -LiteralPath $runtimePath) {
+    try {
+        $existing = Get-Content -LiteralPath $runtimePath -Raw | ConvertFrom-Json
+        foreach ($property in $existing.PSObject.Properties) { $runtime[$property.Name] = $property.Value }
+    } catch { $runtime = @{} }
+}
+$runtime.stabilization = [bool]$Stabilization
+$runtime.dome = [bool]$VR180Dome
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[IO.File]::WriteAllText($runtimePath, ($runtime | ConvertTo-Json -Compress), $utf8NoBom)
 
 if ($OculusVaM -and $TestGrid) {
     throw "-OculusVaM and -TestGrid are mutually exclusive."

@@ -77,6 +77,7 @@ struct Config {
     bool     topmost     = false;
     bool     supersample = true;   // 2x2 box taps: cleaner downsample of supersampled mirrors
     bool     stabilization = false; // POC: source-pose rotational stabilization, default off
+    bool     fullDome = false;      // classic 180x180 dome; production FOV-fit stays default
     bool     stabilizationSelfTest = false;
     float    featherDeg  = 1.5f;
     std::string dumpFrame;
@@ -142,6 +143,20 @@ static void pollRuntimeFile() {
                 g_cfg.stabilization = enabled;
                 computeSpans();
                 logf("runtime.json: stabilization -> %s", enabled ? "on" : "off");
+            }
+        }
+    }
+    k = strstr(buf, "\"dome\"");
+    if (k) {
+        const char* colon = strchr(k, ':');
+        if (colon) {
+            while (*++colon == ' ' || *colon == '\t') {}
+            const bool enabled = strncmp(colon, "true", 4) == 0;
+            const bool disabled = strncmp(colon, "false", 5) == 0;
+            if ((enabled || disabled) && g_cfg.fullDome != enabled) {
+                g_cfg.fullDome = enabled;
+                computeSpans();
+                logf("runtime.json: VR180 dome -> %s", enabled ? "on" : "off");
             }
         }
     }
@@ -395,7 +410,7 @@ static void writeStatusFile() {
     }
     FILE* f = nullptr;
     if (fopen_s(&f, path, "wb") == 0 && f) {
-        fprintf(f, "{\"hspan\":%.1f,\"vspan\":%.1f,\"sourceHspan\":%.1f,\"sourceVspan\":%.1f,\"stabilizationOverscanDeg\":%.1f,\"live\":%d,\"srcfps\":%d,\"gamefps\":%d,\"canvasW\":%d,\"canvasH\":%d,\"oculusOpenHr\":%ld,\"oculusOpenStage\":%d,\"stabilization\":%d,\"sourcePoseValid\":%d,\"stabilizationCorrectionDeg\":%.3f}",
+        fprintf(f, "{\"hspan\":%.1f,\"vspan\":%.1f,\"sourceHspan\":%.1f,\"sourceVSpan\":%.1f,\"stabilizationOverscanDeg\":%.1f,\"live\":%d,\"srcfps\":%d,\"gamefps\":%d,\"canvasW\":%d,\"canvasH\":%d,\"oculusOpenHr\":%ld,\"oculusOpenStage\":%d,\"stabilization\":%d,\"dome\":%d,\"sourcePoseValid\":%d,\"stabilizationCorrectionDeg\":%.3f}",
             vrs.hSpanRad * 180.0f / 3.14159265f,
             vrs.vSpanRad * 180.0f / 3.14159265f,
             vrs.sourceHSpanRad * 180.0f / 3.14159265f,
@@ -410,6 +425,7 @@ static void writeStatusFile() {
             g_cfg.width, g_cfg.height, g_oculusOpenHr.load(std::memory_order_relaxed),
             g_oculusOpenStage.load(std::memory_order_relaxed),
             g_cfg.stabilization ? 1 : 0,
+            g_cfg.fullDome ? 1 : 0,
             g_sourcePoseValid.load(std::memory_order_relaxed),
             g_stabilizationCorrectionMilliDeg.load(std::memory_order_relaxed) / 1000.0);
         fclose(f);
@@ -434,10 +450,12 @@ static void computeSpans() {
         sourceH = std::min(PI_, 2.0f * maxH);
         sourceV = std::min(PI_, 2.0f * maxV);
     }
-    const float h = g_cfg.stabilization
+    const float fittedH = g_cfg.stabilization
         ? std::max(minimumSpan, sourceH - stabilizationReserve) : sourceH;
-    const float v = g_cfg.stabilization
+    const float fittedV = g_cfg.stabilization
         ? std::max(minimumSpan, sourceV - stabilizationReserve) : sourceV;
+    const float h = g_cfg.fullDome ? PI_ : fittedH;
+    const float v = g_cfg.fullDome ? PI_ : fittedV;
     vrs.sourceHSpanRad = sourceH;
     vrs.sourceVSpanRad = sourceV;
     if (fabsf(h - vrs.hSpanRad) > 0.002f || fabsf(v - vrs.vSpanRad) > 0.002f) {
@@ -446,8 +464,9 @@ static void computeSpans() {
         logf("canvas span: %.1f x %.1f deg from %.1f x %.1f source%s",
             h * 180.0f / PI_, v * 180.0f / PI_,
             sourceH * 180.0f / PI_, sourceV * 180.0f / PI_,
-            g_cfg.stabilization ? " (stabilization overscan)" :
-                (vrs.connected ? " (FOV-fit)" : " (waiting for source FOV)"));
+            g_cfg.fullDome ? " (full VR180 dome)" :
+                (g_cfg.stabilization ? " (stabilization overscan)" :
+                    (vrs.connected ? " (FOV-fit)" : " (waiting for source FOV)")));
     }
     // the status file is written by the I/O thread, never from the render loop
 }

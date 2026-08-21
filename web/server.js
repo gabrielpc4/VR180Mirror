@@ -88,6 +88,9 @@ function settings(req, res) {
         if (typeof body.stabilization === "boolean") {
           cur.stabilization = body.stabilization;
         }
+        if (typeof body.dome === "boolean") {
+          cur.dome = body.dome;
+        }
         fs.writeFileSync(RUNTIME_FILE, JSON.stringify(cur));
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(cur));
@@ -172,6 +175,7 @@ function handler(req, res) {
         mirrorLive: spans.live === 1,
         srcFps: spans.srcfps, gameFps: spans.gamefps,
         stabilization: spans.stabilization === 1,
+        dome: spans.dome === 1,
         sourcePoseValid: spans.sourcePoseValid === 1,
         stabilizationCorrectionDeg: spans.stabilizationCorrectionDeg || 0,
         canvasW: spans.canvasW, canvasH: spans.canvasH, ...extra }));

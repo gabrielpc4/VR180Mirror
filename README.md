@@ -180,9 +180,9 @@ shortcut at a scheduled task, so it starts elevated without a UAC prompt every t
 
 ## What to expect
 
-- The canvas is always fitted to the game's real FOV (~114°×116°) and the viewer's dome is built
-  with matching angles, so every pixel carries picture instead of black bars. The old full-180
-  launch override was removed so a stale command cannot silently change scale or framing.
+- By default the canvas is fitted to the game's real FOV and the native spectator layer uses
+  matching angles, so every pixel carries picture instead of black bars. The desktop panel's
+  explicit VR180 dome toggle is the only supported way to expand this to 180°×180°.
 - The view is head-locked to the **player's** head (that is the point!). Spectators sensitive to
   motion sickness should sit down.
 - SteamVR overlays/dashboard the player sees are included (it mirrors the compositor output).
@@ -275,6 +275,17 @@ rebinds its decoder layer because the angular contract changes:
 Invoke-RestMethod http://127.0.0.1:9080/settings -Method Post -ContentType application/json -Body '{"stabilization":true}'
 Invoke-RestMethod http://127.0.0.1:9080/settings -Method Post -ContentType application/json -Body '{"stabilization":false}'
 ```
+
+## Desktop control panel
+
+Run `Setup-DesktopShortcut.ps1` once. The **VR Spectator Control** shortcut then starts the
+complete pipeline and launches the native spectator app automatically. Its toggles apply live:
+
+- **Image stabilization** enables or disables source-pose stabilization.
+- **VR180 dome** switches between the classic 180x180 dome and the sharper exact-FOV viewport.
+  It is deliberately reset to **off** whenever the panel opens.
+- **Stop Everything** force-stops the headset client and closes the mirror, the dedicated OBS
+  stream, MediaMTX, the web server, and the panel without an exit confirmation.
 
 When enabled, the displayed viewport reserves 12 degrees of the full source
 coverage (six degrees per edge). The filter counter-rotates immediately,
