@@ -65,6 +65,11 @@ $initialStabilization = if ($runtime.ContainsKey("stabilization")) {
 } else {
     $true
 }
+$initialDome = if ($runtime.ContainsKey("dome")) {
+    [bool]$runtime.dome
+} else {
+    $false
+}
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "VR Spectator Control"
@@ -99,13 +104,13 @@ $form.Controls.Add($stabilizationBox)
 
 $domeBox = New-Object System.Windows.Forms.CheckBox
 $domeBox.Text = "VR180 dome (lower sharpness)"
-$domeBox.Checked = $false
+$domeBox.Checked = $initialDome
 $domeBox.AutoSize = $true
 $domeBox.Location = New-Object System.Drawing.Point(30, 132)
 $form.Controls.Add($domeBox)
 
 $defaultLabel = New-Object System.Windows.Forms.Label
-$defaultLabel.Text = "Dome mode is always OFF when this panel opens. Changes apply live."
+$defaultLabel.Text = "Dome mode is OFF by default, remembered when you enable it. Changes apply live."
 $defaultLabel.ForeColor = [System.Drawing.Color]::FromArgb(160, 168, 180)
 $defaultLabel.AutoSize = $true
 $defaultLabel.Location = New-Object System.Drawing.Point(48, 158)
@@ -221,8 +226,7 @@ $timer.Add_Tick({
 })
 
 $form.Add_Shown({
-    # Explicitly enforce the requested safe default before any process starts.
-    $domeBox.Checked = $false
+    # Keep the safe first-run default, but preserve an explicit user choice across panel restarts.
     Apply-Toggles
     Start-Workflow
     $timer.Start()
